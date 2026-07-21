@@ -66,3 +66,27 @@ def test_verify_prebuilt_tree_does_not_rebuild_and_commits_existing_path():
     assert result["visited_node_ids"] == [0, 1]
     assert result["committed_token_ids"] == [3, 4, 3, 4]
     assert result["stop_reason"] == "reached_final_expanded_depth"
+
+
+def test_traverse_precomputed_tree_uses_no_model_calls():
+    drafter = OneCandidateDrafter()
+    builder = AsymmetricTreeBuilder(drafter, [1, 1], [1, 1], 0, 4, 8)
+    prefix = torch.tensor([1, 2])
+    tree = builder.build(prefix)
+    for node in tree.nodes.values():
+        for candidate in node.candidate_set:
+            candidate.verifier_token_logprobs = (-0.1, -0.2)
+            candidate.verifier_log_score = -0.3
+            candidate.q_normalized = 1.0
+            candidate.p_normalized = 1.0
+    cfg = {
+        "seed": 1,
+        "sampling": {"proposal_mode": "top1_q"},
+        "residual": {"epsilon": 1e-12},
+        "logging": {"print_verification_trace": False},
+    }
+    decoder = BlockSpeculativeDecoder(drafter, None, TinyTokenizer(), builder, cfg)
+    result = decoder.traverse_precomputed_tree(tree, prefix, max_blocks=2)
+    assert result["blocks_committed"] == 2
+    assert result["model_calls_during_traversal"] == 0
+    assert result["committed_token_ids"] == [3, 4, 3, 4]

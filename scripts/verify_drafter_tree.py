@@ -1,19 +1,22 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import sys
 from pathlib import Path
 
+import torch
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from block_spec.ar_block_scorer import ARBlockScorer
 from block_spec.decoder import BlockSpeculativeDecoder
 from block_spec.drafter_tree_inspection import build_multi_step_tree_report
 from block_spec.fast_dllm_adapter import FastDLLMv2Adapter
 from block_spec.tokenizer_compatibility import validate_tokenizer_compatibility
+from block_spec.tree_ar_scorer import ARTreeScorer
 from block_spec.tree_builder import AsymmetricTreeBuilder
 from block_spec.verifier_loader import load_local_causal_model
 
@@ -43,8 +46,7 @@ def parse_args():
     parser.add_argument("--drafter-dtype", choices=("float16", "bfloat16", "float32"), default="float16")
     parser.add_argument("--verifier-dtype", choices=("float16", "bfloat16", "float32"), default="float16")
     parser.add_argument("--device-map", default="auto")
-    parser.add_argument("--verifier-candidate-batch-size", type=int, default=8)
-    parser.add_argument("--enable-bonus-token", action="store_true")
+    parser.add_argument("--logsumexp-row-chunk-size", type=int, default=32)
     parser.add_argument("--output", default="outputs/prebuilt_tree_verification.json")
     parser.add_argument("--tree-output", default="outputs/prebuilt_drafter_tree.json")
     parser.add_argument("--allow-model-download", action="store_true")
@@ -79,7 +81,7 @@ def main():
     if len(width_schedule) != args.depth:
         raise ValueError("width schedule length must equal --depth")
 
-    print("\n[1/4] Loading Fast-dLLM drafter only...", flush=True)
+    print("\n[1/5] Loading Fast-dLLM drafter only...", flush=True)
     drafter_model, drafter_tokenizer = load_local_causal_model(
         args.drafter_model_path,
         dtype=args.drafter_dtype,
@@ -115,7 +117,7 @@ def main():
         max_tree_tokens=args.max_tree_tokens,
         confidence_mode="cumulative_log_score",
     )
-    print("\n[2/4] Building the complete drafter tree before verification...", flush=True)
+    print("\n[2/5] Building the complete drafter tree before verification...", flush=True)
     tree = builder.build(prefix_ids)
     print(f"Tree complete: nodes={len(tree.nodes)} widths={tree.widths()}", flush=True)
     tree_report = build_multi_step_tree_report(
@@ -129,13 +131,25 @@ def main():
     )
     save_json(tree_report, args.tree_output)
 
-    print("\n[3/4] Loading Qwen verifier after the tree is complete...", flush=True)
+    # Phase 1 is complete. Release the drafter before loading Qwen so the one-pass
+    # verifier stays on GPU instead of silently offloading layers to CPU.
+    del builder, adapter, drafter_model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        print(
+            f"Drafter released; GPU allocated={torch.cuda.memory_allocated() / 2**30:.2f} GiB",
+            flush=True,
+        )
+
+    print("\n[3/5] Loading Qwen verifier after the tree is complete...", flush=True)
     verifier_model, verifier_tokenizer = load_local_causal_model(
         args.verifier_model_path,
         dtype=args.verifier_dtype,
         device_map=args.device_map,
         local_files_only=True,
         allow_model_download=args.allow_model_download,
+        attn_implementation="sdpa",
     )
     validate_tokenizer_compatibility(
         drafter_tokenizer,
@@ -150,7 +164,7 @@ def main():
             "temperature": 1.0,
             "top_k": None,
             "top_p": 1.0,
-            "enable_bonus_token": args.enable_bonus_token,
+            "enable_bonus_token": False,
         },
         "residual": {
             "enabled": True,
@@ -164,22 +178,31 @@ def main():
         },
     }
     decoder = BlockSpeculativeDecoder(
-        adapter,
-        ARBlockScorer(verifier_model, args.verifier_candidate_batch_size),
+        None,
+        None,
         verifier_tokenizer,
-        builder,
+        None,
         config,
     )
-    print("\n[4/4] Traversing the already-built tree; drafter will not run again...", flush=True)
-    result = decoder.verify_prebuilt_tree(
-        tree,
-        prefix_ids,
-        max_blocks=args.depth,
-        enable_bonus_token=args.enable_bonus_token,
+    print("\n[4/5] Scoring every tree candidate with ONE ancestor-masked AR forward...", flush=True)
+    tree_score = ARTreeScorer(
+        verifier_model, logsumexp_row_chunk_size=args.logsumexp_row_chunk_size
+    ).score_tree(prefix_ids, tree)
+    print(
+        f"Tree AR scoring complete: forward_calls={tree_score['verifier_forward_calls']} "
+        f"candidate_blocks={tree_score['tree_candidate_blocks_scored']} "
+        f"flattened_length={tree_score['flattened_sequence_length']} "
+        f"mask_shape={tree_score['attention_mask_shape']}",
+        flush=True,
+    )
+    print("\n[5/5] Sampling over cached p/q values; model calls during traversal = 0...", flush=True)
+    result = decoder.traverse_precomputed_tree(
+        tree, prefix_ids, max_blocks=args.depth,
     )
     result["prompt"] = prompt
     result["proposal_mode"] = args.proposal_mode
     result["seed"] = args.seed
+    result["tree_ar_scoring"] = tree_score
     save_json(result, args.output)
     print(f"\nCommitted text: {result['committed_text']!r}", flush=True)
     print(f"Saved verification report: {Path(args.output).resolve()}", flush=True)

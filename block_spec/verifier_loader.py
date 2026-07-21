@@ -20,6 +20,7 @@ def load_local_causal_model(
     trust_remote_code: bool = True,
     local_files_only: bool = True,
     allow_model_download: bool = False,
+    attn_implementation: str | None = None,
 ):
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -34,17 +35,18 @@ def load_local_causal_model(
     tokenizer = AutoTokenizer.from_pretrained(
         source, trust_remote_code=trust_remote_code, local_files_only=effective_local
     )
-    model = AutoModelForCausalLM.from_pretrained(
-        source,
-        trust_remote_code=trust_remote_code,
-        torch_dtype=resolve_dtype(dtype),
-        device_map=device_map,
-        local_files_only=effective_local,
-    ).eval()
+    model_kwargs = {
+        "trust_remote_code": trust_remote_code,
+        "torch_dtype": resolve_dtype(dtype),
+        "device_map": device_map,
+        "local_files_only": effective_local,
+    }
+    if attn_implementation is not None:
+        model_kwargs["attn_implementation"] = attn_implementation
+    model = AutoModelForCausalLM.from_pretrained(source, **model_kwargs).eval()
     print(f"Model class: {model.__class__.__name__}")
     print(f"Tokenizer class: {tokenizer.__class__.__name__}")
     print(f"Vocabulary size: {len(tokenizer)}")
     if torch.cuda.is_available():
         print(f"GPU allocated after load: {torch.cuda.memory_allocated() / 2**30:.2f} GiB")
     return model, tokenizer
-

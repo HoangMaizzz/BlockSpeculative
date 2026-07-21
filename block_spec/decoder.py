@@ -170,6 +170,148 @@ class BlockSpeculativeDecoder:
         }
         return result, diagnostics, child
 
+    def _sample_precomputed_node(self, tree, node):
+        if any(
+            candidate.p_normalized is None or candidate.q_normalized is None
+            for candidate in node.candidate_set
+        ):
+            raise RuntimeError(
+                f"Node {node.node_id} is missing precomputed tree-verifier probabilities"
+            )
+        q_probs = torch.tensor([candidate.q_normalized for candidate in node.candidate_set], dtype=torch.float64)
+        p_probs = torch.tensor([candidate.p_normalized for candidate in node.candidate_set], dtype=torch.float64)
+        proposed = select_proposal(
+            q_probs, self.config["sampling"].get("proposal_mode", "sample_q"), self.generator
+        )
+        decision = decide_acceptance(
+            proposed, node.candidate_set[proposed].token_ids, p_probs, q_probs, self.generator
+        )
+        residual = None
+        residual_used = False
+        fallback = False
+        committed = proposed
+        residual_started = None
+        if not decision.accepted:
+            residual_started = time.perf_counter()
+            residual, fallback = compute_residual_distribution(
+                p_probs, q_probs, float(self.config["residual"].get("epsilon", 1e-12))
+            )
+            committed = int(torch.multinomial(residual, 1, generator=self.generator))
+            residual_used = True
+            for index, candidate in enumerate(node.candidate_set):
+                candidate.residual_probability = float(residual[index])
+        child = tree.child_for_candidate(node, committed)
+        raw_q_mass = sum(math.exp(candidate.drafter_log_score) for candidate in node.candidate_set)
+        raw_p_mass = sum(math.exp(float(candidate.verifier_log_score)) for candidate in node.candidate_set)
+        self._print_node_trace(
+            node, decision, q_probs, p_probs, residual, committed, child,
+            raw_q_mass, raw_p_mass, fallback,
+        )
+        result = NodeVerificationResult(
+            node.node_id,
+            proposed,
+            decision.accepted,
+            committed,
+            residual_used,
+            child is not None,
+            None if child is not None else "committed_candidate_is_unexpanded_leaf",
+        )
+        diagnostics = {
+            "candidate_mass_q": raw_q_mass,
+            "candidate_mass_p": raw_p_mass,
+            "proposed_block": list(node.candidate_set[proposed].token_ids),
+            "accepted": decision.accepted,
+            "acceptance_probability": decision.acceptance_probability,
+            "uniform_sample": decision.uniform_sample,
+            "random_seed": int(self.config.get("seed", 42)),
+            "residual_used": residual_used,
+            "residual_sampled_candidate_index": committed if residual_used else None,
+            "residual_degenerate_fallback": fallback,
+            "residual_time_ms": (
+                (time.perf_counter() - residual_started) * 1000 if residual_started is not None else 0.0
+            ),
+            "committed_block": list(node.candidate_set[committed].token_ids),
+            "continued_in_tree": child is not None,
+            "probabilities_precomputed": True,
+        }
+        return result, diagnostics, child
+
+    def traverse_precomputed_tree(
+        self,
+        tree,
+        prefix_ids: torch.LongTensor,
+        *,
+        max_blocks: int | None = None,
+    ) -> dict:
+        """Sample a path using probabilities already attached by ``ARTreeScorer``.
+
+        This method makes no drafter or verifier model calls.
+        """
+        prefix = prefix_ids.reshape(-1).long().cpu()
+        node = tree.root
+        committed_tokens: list[int] = []
+        decisions: list[dict] = []
+        visited_node_ids: list[int] = []
+        blocks_committed = 0
+        stop_reason = None
+        eos_ids = self.tokenizer.eos_token_id
+        eos_ids = {eos_ids} if isinstance(eos_ids, int) else set(eos_ids or [])
+        if self._trace_enabled():
+            print(
+                f"\n[PRECOMPUTED TREE SAMPLING] nodes={len(tree.nodes)} widths={tree.widths()} "
+                "model_calls_during_traversal=0",
+                flush=True,
+            )
+        while node.candidate_set:
+            if max_blocks is not None and blocks_committed >= max_blocks:
+                stop_reason = "max_blocks_reached"
+                break
+            visited_node_ids.append(node.node_id)
+            result, diagnostics, child = self._sample_precomputed_node(tree, node)
+            block = node.candidate_set[result.committed_candidate_index].token_ids
+            committed_tokens.extend(block)
+            prefix = torch.cat((prefix, torch.tensor(block, dtype=torch.long)))
+            blocks_committed += 1
+            decisions.append(
+                {
+                    **result.__dict__,
+                    **diagnostics,
+                    "depth": node.depth,
+                    "committed_text": self._block_text(block),
+                    "prefix_length_after_commit": int(prefix.numel()),
+                }
+            )
+            if any(token_id in eos_ids for token_id in block):
+                stop_reason = "eos_in_committed_block"
+                break
+            if child is None:
+                stop_reason = "committed_candidate_has_no_expanded_child"
+                break
+            node = child
+            if not node.candidate_set:
+                stop_reason = "reached_final_expanded_depth"
+                break
+        if stop_reason is None:
+            stop_reason = "tree_has_no_more_candidate_sets"
+        summary = {
+            "tree_nodes": len(tree.nodes),
+            "tree_widths": tree.widths(),
+            "visited_node_ids": visited_node_ids,
+            "blocks_committed": blocks_committed,
+            "committed_token_ids": committed_tokens,
+            "committed_text": self.tokenizer.decode(committed_tokens, skip_special_tokens=True),
+            "stop_reason": stop_reason,
+            "model_calls_during_traversal": 0,
+            "decisions": decisions,
+        }
+        if self._trace_enabled():
+            print(
+                f"[PRECOMPUTED TREE DONE] visited={visited_node_ids} blocks={blocks_committed} "
+                f"stop_reason={stop_reason} text={summary['committed_text']!r}",
+                flush=True,
+            )
+        return summary
+
     def verify_prebuilt_tree(
         self,
         tree,
