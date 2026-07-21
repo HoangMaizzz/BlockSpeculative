@@ -294,11 +294,17 @@ class BlockSpeculativeDecoder:
                 break
         if stop_reason is None:
             stop_reason = "tree_has_no_more_candidate_sets"
+        accepted_blocks = sum(bool(item["accepted"]) for item in decisions)
+        rejected_blocks = sum(not bool(item["accepted"]) for item in decisions)
+        residual_blocks = sum(bool(item["residual_used"]) for item in decisions)
         summary = {
             "tree_nodes": len(tree.nodes),
             "tree_widths": tree.widths(),
             "visited_node_ids": visited_node_ids,
             "blocks_committed": blocks_committed,
+            "accepted_blocks": accepted_blocks,
+            "rejected_blocks": rejected_blocks,
+            "residual_blocks": residual_blocks,
             "committed_token_ids": committed_tokens,
             "committed_text": self.tokenizer.decode(committed_tokens, skip_special_tokens=True),
             "stop_reason": stop_reason,
@@ -307,7 +313,9 @@ class BlockSpeculativeDecoder:
         }
         if self._trace_enabled():
             print(
-                f"[PRECOMPUTED TREE DONE] visited={visited_node_ids} blocks={blocks_committed} "
+                f"[PRECOMPUTED TREE DONE] visited={visited_node_ids} "
+                f"committed={blocks_committed} accepted={accepted_blocks} "
+                f"rejected={rejected_blocks} residual={residual_blocks} "
                 f"stop_reason={stop_reason} text={summary['committed_text']!r}",
                 flush=True,
             )

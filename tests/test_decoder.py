@@ -89,4 +89,6 @@ def test_traverse_precomputed_tree_uses_no_model_calls():
     result = decoder.traverse_precomputed_tree(tree, prefix, max_blocks=2)
     assert result["blocks_committed"] == 2
     assert result["model_calls_during_traversal"] == 0
+    assert result["blocks_committed"] == result["accepted_blocks"] + result["residual_blocks"]
+    assert result["rejected_blocks"] == result["residual_blocks"]
     assert result["committed_token_ids"] == [3, 4, 3, 4]

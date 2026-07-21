@@ -229,6 +229,16 @@ def main():
             max_blocks=min(args.depth, remaining // args.block_size),
         )
         committed = sampled["committed_token_ids"]
+        print(
+            f"[ROUND SUMMARY] round={round_index} "
+            f"committed_blocks={sampled['blocks_committed']} "
+            f"accepted_blocks={sampled['accepted_blocks']} "
+            f"rejected_blocks={sampled['rejected_blocks']} "
+            f"residual_blocks={sampled['residual_blocks']} "
+            f"committed_tokens={len(committed)} "
+            f"stop_reason={sampled['stop_reason']}",
+            flush=True,
+        )
         if not committed:
             token = verifier_one_token(verifier_model, prefix, generator)
             committed = [token]
@@ -267,6 +277,18 @@ def main():
     if any(token in eos_ids for token in generated):
         generated = generated[: next(i for i, token in enumerate(generated) if token in eos_ids) + 1]
     text = verifier_tokenizer.decode(generated, skip_special_tokens=True)
+    total_committed_blocks = sum(
+        report["sampling"]["blocks_committed"] for report in round_reports
+    )
+    total_accepted_blocks = sum(
+        report["sampling"]["accepted_blocks"] for report in round_reports
+    )
+    total_rejected_blocks = sum(
+        report["sampling"]["rejected_blocks"] for report in round_reports
+    )
+    total_residual_blocks = sum(
+        report["sampling"]["residual_blocks"] for report in round_reports
+    )
     result = {
         "prompt": prompt,
         "prompt_token_count": prompt_token_count,
@@ -275,6 +297,10 @@ def main():
         "text": text,
         "stop_reason": stop_reason,
         "elapsed_seconds": time.perf_counter() - started,
+        "total_committed_blocks": total_committed_blocks,
+        "total_accepted_blocks": total_accepted_blocks,
+        "total_rejected_blocks": total_rejected_blocks,
+        "total_residual_blocks": total_residual_blocks,
         "rounds": round_reports,
     }
     target = Path(args.output)
