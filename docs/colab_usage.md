@@ -24,8 +24,9 @@ verifier such as Qwen2.5-3B loaded once, then repeats build, union enrichment,
 one-pass tree scoring, and cached residual traversal until EOS, a final-answer
 pattern, or the new-token limit.
 
-The default five-level draft width is `[5, 20, 20, 20, 20]`. Selection is
+The default draft uses three consecutive 3-token blocks with width
+`[5, 15, 15]`. Selection is
 global by cumulative drafter log-probability with no mandatory depth-2 parent
 quota, so high-probability parents may contribute more children. The default
-budgets are 96 tree nodes and 320 tree tokens, sufficient for all 86 nodes at
-block length 3.
+budgets are 48 tree nodes and 128 tree tokens, sufficient for all 36 nodes and
+105 drafted path tokens.
