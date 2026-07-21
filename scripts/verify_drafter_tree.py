@@ -45,7 +45,7 @@ def parse_args():
     parser.add_argument(
         "--verifier-max-gpu-memory-gib",
         type=int,
-        default=18,
+        default=14,
         help="GPU budget passed to device_map=auto, leaving activation headroom on a 22 GiB L4",
     )
     parser.add_argument("--verifier-max-cpu-memory-gib", type=int, default=45)
@@ -229,6 +229,7 @@ def main():
             block_size=args.block_size,
             topk=args.verifier_block_topk,
             batch_size=args.verifier_beam_batch_size,
+            vocab_limit=len(verifier_tokenizer),
         ).search_tree(prefix_ids, tree)
         union_diagnostics.update(beam_diagnostics)
         union_diagnostics.update(merge_verifier_topk_into_tree(tree, verifier_beams))

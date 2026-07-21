@@ -31,11 +31,19 @@ def _node_prefixes(prefix_ids: torch.LongTensor, tree) -> dict[int, torch.LongTe
 class ARVerifierTopKBlockSearch:
     """Batched AR beam approximation of verifier Top-K blocks for many nodes."""
 
-    def __init__(self, model, block_size: int, topk: int = 5, batch_size: int = 16):
+    def __init__(
+        self,
+        model,
+        block_size: int,
+        topk: int = 5,
+        batch_size: int = 16,
+        vocab_limit: int | None = None,
+    ):
         self.model = model
         self.block_size = int(block_size)
         self.topk = int(topk)
         self.batch_size = max(1, int(batch_size))
+        self.vocab_limit = int(vocab_limit) if vocab_limit is not None else None
         if self.block_size < 1 or self.topk < 1:
             raise ValueError("block_size and topk must be positive")
 
@@ -80,11 +88,15 @@ class ARVerifierTopKBlockSearch:
                 rows, lengths.to(output.last_hidden_state.device) - 1
             ]
             logits = lm_head(last_hidden)
+        valid_vocab = logits.shape[-1]
+        if self.vocab_limit is not None:
+            valid_vocab = min(valid_vocab, self.vocab_limit)
+        valid_logits = logits[:, :valid_vocab]
         values, token_ids = torch.topk(
-            logits, k=min(self.topk, logits.shape[-1]), dim=-1, sorted=True
+            valid_logits, k=min(self.topk, valid_vocab), dim=-1, sorted=True
         )
         result = (values.float().cpu(), token_ids.cpu())
-        del ids, attention, position_ids, output, logits
+        del ids, attention, position_ids, output, logits, valid_logits
         return result
 
     def _expand_stage(
@@ -155,6 +167,7 @@ class ARVerifierTopKBlockSearch:
             "nodes_searched": len(prefixes),
             "block_size": self.block_size,
             "verifier_block_topk": self.topk,
+            "verifier_vocab_limit": self.vocab_limit,
             "batch_size_used": batch_size,
             "verifier_forward_calls": forward_calls,
         }

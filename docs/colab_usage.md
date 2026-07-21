@@ -14,6 +14,6 @@ To inspect one complete asymmetric tree with the shared union support, run
 `scripts/verify_drafter_tree.py` with `--candidate-set-mode union_topk`. Each
 node keeps its Fast-dLLM marginal table in FP16 CPU memory, while verifier beam
 logits are reduced to Top-K immediately. On an L4, the defaults reserve Qwen to
-18 GiB of GPU weight placement and start verifier beam batches at 8; lower
+14 GiB of GPU weight placement and start verifier beam batches at 8; lower
 `--verifier-beam-batch-size` or `--verifier-max-gpu-memory-gib` if another
 notebook allocation is present.

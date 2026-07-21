@@ -56,11 +56,13 @@ def test_verifier_beam_union_adds_blocks_and_looks_up_q():
     tree = DraftTree({0: root})
     model = TinyVerifier()
     beams, diagnostics = ARVerifierTopKBlockSearch(
-        model, block_size=2, topk=2, batch_size=4
+        model, block_size=2, topk=2, batch_size=4, vocab_limit=6
     ).search_tree(torch.tensor([1, 2]), tree)
     assert len(beams[0]) == 2
     assert model.model.forward_calls == 2
     assert diagnostics["verifier_forward_calls"] == 2
+    assert diagnostics["verifier_vocab_limit"] == 6
+    assert all(token_id < 6 for beam in beams[0] for token_id in beam.token_ids)
     merged = merge_verifier_topk_into_tree(tree, beams)
     assert merged["verifier_only_blocks_added"] + merged["duplicate_blocks_merged"] == 2
     for candidate in root.candidate_set:
