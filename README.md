@@ -60,6 +60,23 @@ The default schedule is `[5, 20, 10, 5, 2, 1]`. The second depth first grants tw
 
 See [repository inspection](docs/repository_inspection.md), [algorithm](docs/algorithm.md), [Colab guide](docs/colab_usage.md), and [limitations](docs/limitations.md).
 
+## Inspect a Fast-dLLM draft tree without Qwen
+
+To build five consecutive three-token block levels, with asymmetric branching,
+per-token probabilities, raw block joint probability, and local normalized probability—
+without loading Qwen—run:
+
+```bash
+python -u scripts/inspect_drafter_tree.py \
+  --drafter-model-path "$DRAFTER_MODEL_PATH" \
+  --prompt "Natalia sold 48 clips in April and half as many in May. How many did she sell altogether?" \
+  --block-size 3 --num-block-candidates 5 --per-position-topk 8 \
+  --depth 5 --width-schedule 5,20,10,5,1
+```
+
+The JSON report is saved to `outputs/drafter_tree_step1.json`. See the
+[Kaggle guide](docs/kaggle_usage.md) for attached and downloadable model setups.
+
 ## Git/GitHub workflow
 
 This supplied directory did not contain `.git`, so no branch or commits were created automatically. From the repository root:
