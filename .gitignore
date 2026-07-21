@@ -1,0 +1,13 @@
+models/
+checkpoints/
+outputs/
+*.safetensors
+*.bin
+*.pt
+*.pth
+__pycache__/
+.pytest_cache/
+.ipynb_checkpoints/
+.env
+*.egg-info/
+

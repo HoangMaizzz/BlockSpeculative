@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "block-spec-fastdllm"
+version = "0.1.0"
+description = "Block-level speculative decoding using Fast-dLLM v2 and Qwen"
+requires-python = ">=3.10"
+dependencies = ["torch", "transformers>=4.53.1,<5", "accelerate", "PyYAML", "einops>=0.8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.setuptools.packages.find]
+include = ["block_spec*"]

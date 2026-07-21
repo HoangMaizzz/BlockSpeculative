@@ -1,0 +1,6 @@
+transformers>=4.53.1,<5
+accelerate>=1.0
+PyYAML>=6.0
+numpy>=1.26
+einops>=0.8
+pytest>=8.0

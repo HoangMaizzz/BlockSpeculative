@@ -1,0 +1,49 @@
+seed: 42
+drafter:
+  model_path: null
+  block_size: 5
+  diffusion_steps: null
+  num_block_candidates: 5
+  per_position_topk: 8
+  joint_search_backend: heap
+  candidate_set_mode: drafter_topk
+  dtype: float16
+  native_block_size: 32
+  mask_token_id: 151665
+verifier:
+  model_path: /content/models/qwen-7b
+  local_files_only: true
+  trust_remote_code: true
+  dtype: float16
+  device_map: auto
+  candidate_batch_size: 16
+tokenizers:
+  require_compatibility: true
+tree:
+  width_schedule: [5, 20, 10, 5, 2, 1]
+  parent_cap_schedule: [5, 5, 3, 2, 1, 1]
+  depth2_min_children_per_parent: 2
+  depth2_max_children_per_parent: 5
+  max_tree_nodes: 64
+  max_tree_tokens: 320
+  confidence_mode: cumulative_log_score
+sampling:
+  proposal_mode: sample_q
+  temperature: 1.0
+  top_k: null
+  top_p: 1.0
+  enable_bonus_token: true
+residual:
+  enabled: true
+  epsilon: 1.0e-12
+  degenerate_fallback: sample_p
+  mass_warning_threshold: 0.95
+  mass_target_threshold: 0.99
+  strict_mass: false
+generation:
+  max_new_tokens: 128
+  fallback_mode: target_one_token
+logging:
+  output_dir: outputs
+  save_jsonl: true
+  print_tree: true
