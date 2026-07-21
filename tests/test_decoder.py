@@ -45,3 +45,24 @@ def test_end_to_end_dummy_generation():
     assert result.token_ids == [3, 4]
     assert result.generated_token_count == 2
     assert len(result.rounds) == 1
+
+
+def test_verify_prebuilt_tree_does_not_rebuild_and_commits_existing_path():
+    drafter = OneCandidateDrafter()
+    builder = AsymmetricTreeBuilder(drafter, [1, 1], [1, 1], 0, 4, 8)
+    prefix = torch.tensor([1, 2])
+    tree = builder.build(prefix)
+    cfg = {
+        "seed": 1,
+        "sampling": {"proposal_mode": "top1_q", "temperature": 0.0, "top_p": 1.0, "top_k": None},
+        "residual": {"epsilon": 1e-12, "mass_warning_threshold": 0.0},
+        "logging": {"print_verification_trace": False},
+    }
+    decoder = BlockSpeculativeDecoder(
+        drafter, ARBlockScorer(TinyModel(), 2), TinyTokenizer(), builder, cfg
+    )
+    result = decoder.verify_prebuilt_tree(tree, prefix, max_blocks=2)
+    assert result["blocks_committed"] == 2
+    assert result["visited_node_ids"] == [0, 1]
+    assert result["committed_token_ids"] == [3, 4, 3, 4]
+    assert result["stop_reason"] == "reached_final_expanded_depth"

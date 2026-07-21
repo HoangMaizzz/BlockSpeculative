@@ -170,6 +170,101 @@ class BlockSpeculativeDecoder:
         }
         return result, diagnostics, child
 
+    def verify_prebuilt_tree(
+        self,
+        tree,
+        prefix_ids: torch.LongTensor,
+        *,
+        max_blocks: int | None = None,
+        enable_bonus_token: bool = False,
+    ) -> dict:
+        """Verify exactly one already-built tree without invoking the drafter.
+
+        Only candidate sets on the committed path are scored.  A residual-selected
+        candidate continues when that candidate already owns a child in ``tree``;
+        otherwise traversal stops at the corresponding pruned leaf.
+        """
+        prefix = prefix_ids.reshape(-1).long().cpu()
+        original_prefix_length = int(prefix.numel())
+        node = tree.root
+        committed_tokens: list[int] = []
+        decisions: list[dict] = []
+        visited_node_ids: list[int] = []
+        stop_reason = None
+        blocks_committed = 0
+        eos_ids = self.tokenizer.eos_token_id
+        eos_ids = {eos_ids} if isinstance(eos_ids, int) else set(eos_ids or [])
+        if self._trace_enabled():
+            print(
+                f"\n[PREBUILT TREE VERIFY] root={tree.root_id} nodes={len(tree.nodes)} "
+                f"widths={tree.widths()} prefix_tokens={original_prefix_length}",
+                flush=True,
+            )
+        while node.candidate_set:
+            if max_blocks is not None and blocks_committed >= max_blocks:
+                stop_reason = "max_blocks_reached"
+                break
+            visited_node_ids.append(node.node_id)
+            result, diagnostics, child = self._verify_node(tree, node, prefix.reshape(1, -1))
+            committed_candidate = node.candidate_set[result.committed_candidate_index]
+            block = committed_candidate.token_ids
+            committed_tokens.extend(block)
+            prefix = torch.cat((prefix, torch.tensor(block, dtype=torch.long)))
+            blocks_committed += 1
+            decisions.append(
+                {
+                    **result.__dict__,
+                    **diagnostics,
+                    "depth": node.depth,
+                    "committed_text": self._block_text(block),
+                    "prefix_length_after_commit": int(prefix.numel()),
+                }
+            )
+            if any(token_id in eos_ids for token_id in block):
+                stop_reason = "eos_in_committed_block"
+                break
+            if child is None:
+                stop_reason = "committed_candidate_has_no_expanded_child"
+                break
+            node = child
+            if not node.candidate_set:
+                stop_reason = "reached_final_expanded_depth"
+                break
+        if stop_reason is None:
+            stop_reason = "tree_has_no_more_candidate_sets"
+        bonus_token = None
+        if (
+            enable_bonus_token
+            and stop_reason == "reached_final_expanded_depth"
+        ):
+            bonus_token = self._target_token(prefix.reshape(1, -1))
+            committed_tokens.append(bonus_token)
+            prefix = torch.cat((prefix, torch.tensor([bonus_token], dtype=torch.long)))
+            if self._trace_enabled():
+                print(
+                    f"[BONUS] token={bonus_token} text={self._block_text((bonus_token,))!r}",
+                    flush=True,
+                )
+        summary = {
+            "tree_nodes": len(tree.nodes),
+            "tree_widths": tree.widths(),
+            "original_prefix_length": original_prefix_length,
+            "visited_node_ids": visited_node_ids,
+            "blocks_committed": blocks_committed,
+            "committed_token_ids": committed_tokens,
+            "committed_text": self.tokenizer.decode(committed_tokens, skip_special_tokens=True),
+            "bonus_token": bonus_token,
+            "stop_reason": stop_reason,
+            "decisions": decisions,
+        }
+        if self._trace_enabled():
+            print(
+                f"[PREBUILT TREE DONE] visited={visited_node_ids} blocks={blocks_committed} "
+                f"stop_reason={stop_reason} text={summary['committed_text']!r}",
+                flush=True,
+            )
+        return summary
+
     def generate(self, prompt: str, generation_config: GenerationConfig | None = None) -> GenerationResult:
         gc = generation_config or GenerationConfig(
             max_new_tokens=self.config["generation"].get("max_new_tokens", 128), seed=self.config.get("seed", 42)
