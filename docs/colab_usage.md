@@ -23,6 +23,10 @@ For a complete answer rather than one inspected tree, use
 verifier such as Qwen2.5-3B loaded once, then repeats build, union enrichment,
 one-pass tree scoring, and cached residual traversal until EOS, a final-answer
 pattern, or the new-token limit.
+Its default candidate mode is `drafter_topk`, which builds the complete tree
+before the verifier and uses exactly one verifier tree-forward per normal
+round. `union_topk` remains available explicitly, but requires verifier beam
+discovery before the final tree-forward.
 
 The default draft uses three consecutive 3-token blocks with width
 `[5, 15, 15]`. Selection is

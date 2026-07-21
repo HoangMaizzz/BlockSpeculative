@@ -40,6 +40,11 @@ def parse_args():
     parser.add_argument("--block-size", type=int, default=3)
     parser.add_argument("--num-block-candidates", type=int, default=5)
     parser.add_argument("--per-position-topk", type=int, default=8)
+    parser.add_argument(
+        "--candidate-set-mode",
+        choices=("drafter_topk", "union_topk"),
+        default="drafter_topk",
+    )
     parser.add_argument("--verifier-block-topk", type=int, default=5)
     parser.add_argument("--verifier-beam-batch-size", type=int, default=4)
     parser.add_argument("--depth", type=int, default=3)
@@ -159,13 +164,15 @@ def main():
         max_tree_tokens=args.max_tree_tokens,
         confidence_mode="cumulative_log_score",
     )
-    verifier_search = ARVerifierTopKBlockSearch(
-        verifier_model,
-        block_size=args.block_size,
-        topk=args.verifier_block_topk,
-        batch_size=args.verifier_beam_batch_size,
-        vocab_limit=len(verifier_tokenizer),
-    )
+    verifier_search = None
+    if args.candidate_set_mode == "union_topk":
+        verifier_search = ARVerifierTopKBlockSearch(
+            verifier_model,
+            block_size=args.block_size,
+            topk=args.verifier_block_topk,
+            batch_size=args.verifier_beam_batch_size,
+            vocab_limit=len(verifier_tokenizer),
+        )
     tree_scorer = ARTreeScorer(verifier_model)
     decoder = BlockSpeculativeDecoder(
         None,
@@ -221,8 +228,19 @@ def main():
             flush=True,
         )
 
-        beams, beam_report = verifier_search.search_tree(prefix, tree)
-        union_report = merge_verifier_topk_into_tree(tree, beams)
+        beams = None
+        if verifier_search is not None:
+            beams, beam_report = verifier_search.search_tree(prefix, tree)
+            union_report = merge_verifier_topk_into_tree(tree, beams)
+        else:
+            beam_report = {
+                "candidate_set_mode": "drafter_topk",
+                "verifier_forward_calls": 0,
+            }
+            union_report = {
+                "verifier_only_blocks_added": 0,
+                "duplicate_blocks_merged": 0,
+            }
         score_report = tree_scorer.score_tree(prefix, tree)
         sampled = decoder.traverse_precomputed_tree(
             tree,
@@ -270,7 +288,9 @@ def main():
         ):
             stop_reason = "final_answer_pattern"
             break
-        del tree, beams
+        del tree
+        if beams is not None:
+            del beams
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
