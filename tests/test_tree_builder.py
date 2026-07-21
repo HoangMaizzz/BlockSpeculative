@@ -9,7 +9,8 @@ class DummyDrafter:
     block_size = 2
     def propose(self, prefix):
         candidates = [BlockCandidate((i, i + 10), (-0.1 - i, -0.2), -0.3 - i) for i in range(5)]
-        return DraftCandidates(candidates, (1.0, 1.0), 0.9)
+        table = torch.log_softmax(torch.randn(2, 16), dim=-1).half().cpu()
+        return DraftCandidates(candidates, (1.0, 1.0), 0.9, table)
 
 
 def test_widths_quota_caps_and_budgets():
@@ -23,4 +24,10 @@ def test_widths_quota_caps_and_budgets():
     assert all(len(n.children) >= 2 for n in depth1)
     assert all(len(n.expanded_candidate_indices) <= 5 for n in depth1)
     assert all(len(n.candidate_set) == 5 for n in depth1)
-
+    assert all(
+        node.drafter_marginal_logprobs is not None
+        and node.drafter_marginal_logprobs.device.type == "cpu"
+        and node.drafter_marginal_logprobs.dtype == torch.float16
+        for node in tree.nodes.values()
+        if node.candidate_set
+    )

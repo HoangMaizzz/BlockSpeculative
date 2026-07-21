@@ -47,7 +47,11 @@ class AsymmetricTreeBuilder:
     @torch.inference_mode()
     def build(self, prefix_ids: torch.LongTensor) -> DraftTree:
         first = self.drafter.propose(prefix_ids)
-        root = DraftTreeNode(0, None, 0, None, 0.0, 0.0, 0.0, first.candidates)
+        root = DraftTreeNode(
+            0, None, 0, None, 0.0, 0.0, 0.0,
+            candidate_set=first.candidates,
+            drafter_marginal_logprobs=first.marginal_log_probs,
+        )
         nodes = {0: root}
         active = [root]
         next_id = 1
@@ -92,6 +96,7 @@ class AsymmetricTreeBuilder:
                 if depth < len(self.width_schedule):
                     proposed = self.drafter.propose(torch.tensor(path, dtype=torch.long))
                     child.candidate_set = proposed.candidates
+                    child.drafter_marginal_logprobs = proposed.marginal_log_probs
                 nodes[next_id] = child
                 paths[next_id] = path
                 parent.expanded_candidate_indices.append(candidate_idx)
@@ -101,4 +106,3 @@ class AsymmetricTreeBuilder:
                 next_id += 1
             active = new_active
         return DraftTree(nodes)
-

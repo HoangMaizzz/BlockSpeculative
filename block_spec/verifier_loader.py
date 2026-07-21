@@ -21,6 +21,7 @@ def load_local_causal_model(
     local_files_only: bool = True,
     allow_model_download: bool = False,
     attn_implementation: str | None = None,
+    max_memory: dict | None = None,
 ):
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -43,6 +44,8 @@ def load_local_causal_model(
     }
     if attn_implementation is not None:
         model_kwargs["attn_implementation"] = attn_implementation
+    if max_memory is not None:
+        model_kwargs["max_memory"] = max_memory
     model = AutoModelForCausalLM.from_pretrained(source, **model_kwargs).eval()
     print(f"Model class: {model.__class__.__name__}")
     print(f"Tokenizer class: {tokenizer.__class__.__name__}")

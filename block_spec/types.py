@@ -16,6 +16,7 @@ class BlockCandidate:
     residual_probability: float | None = None
     confidence: float | None = None
     rank: int | None = None
+    candidate_source: str = "drafter"
 
 
 @dataclass
@@ -43,6 +44,7 @@ class DraftTreeNode:
     expanded_candidate_indices: list[int] = field(default_factory=list)
     children: list[int] = field(default_factory=list)
     is_leaf: bool = True
+    drafter_marginal_logprobs: Any | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -86,4 +88,3 @@ class GenerationResult:
     generated_token_count: int
     elapsed_seconds: float
     rounds: list[dict[str, Any]]
-

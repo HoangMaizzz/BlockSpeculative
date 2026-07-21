@@ -62,7 +62,7 @@ class BlockSpeculativeDecoder:
             f"mass_q={raw_q_mass:.6g} mass_p={raw_p_mass:.6g}"
         )
         if self.config.get("logging", {}).get("print_candidate_table", True):
-            print(" idx  role       q_S         p_S         residual    log_q       log_p       block")
+            print(" idx  source            role       q_S         p_S         residual    log_q       log_p       block")
             for i, candidate in enumerate(node.candidate_set):
                 roles = []
                 if i == decision.proposed_index:
@@ -72,7 +72,8 @@ class BlockSpeculativeDecoder:
                 role = "+".join(roles) or "-"
                 residual_value = float(residual[i]) if residual is not None else 0.0
                 print(
-                    f" {i:>3}  {role:<10} {float(q_probs[i]):>10.6f}  {float(p_probs[i]):>10.6f}  "
+                    f" {i:>3}  {candidate.candidate_source:<16} {role:<10} "
+                    f"{float(q_probs[i]):>10.6f}  {float(p_probs[i]):>10.6f}  "
                     f"{residual_value:>10.6f}  {candidate.drafter_log_score:>10.4f}  "
                     f"{float(candidate.verifier_log_score):>10.4f}  {list(candidate.token_ids)} "
                     f"{self._block_text(candidate.token_ids)!r}"

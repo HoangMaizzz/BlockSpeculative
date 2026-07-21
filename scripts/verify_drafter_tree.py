@@ -19,6 +19,10 @@ from block_spec.tokenizer_compatibility import validate_tokenizer_compatibility
 from block_spec.tree_ar_scorer import ARTreeScorer
 from block_spec.tree_builder import AsymmetricTreeBuilder
 from block_spec.verifier_loader import load_local_causal_model
+from block_spec.verifier_candidate_search import (
+    ARVerifierTopKBlockSearch,
+    merge_verifier_topk_into_tree,
+)
 
 
 def parse_args():
@@ -33,6 +37,18 @@ def parse_args():
     parser.add_argument("--block-size", type=int, default=3)
     parser.add_argument("--num-block-candidates", type=int, default=5)
     parser.add_argument("--per-position-topk", type=int, default=8)
+    parser.add_argument(
+        "--candidate-set-mode", choices=("drafter_topk", "union_topk"), default="union_topk"
+    )
+    parser.add_argument("--verifier-block-topk", type=int, default=5)
+    parser.add_argument("--verifier-beam-batch-size", type=int, default=8)
+    parser.add_argument(
+        "--verifier-max-gpu-memory-gib",
+        type=int,
+        default=18,
+        help="GPU budget passed to device_map=auto, leaving activation headroom on a 22 GiB L4",
+    )
+    parser.add_argument("--verifier-max-cpu-memory-gib", type=int, default=45)
     parser.add_argument("--depth", type=int, default=5)
     parser.add_argument("--width-schedule", default="5,20,10,5,1")
     parser.add_argument("--parent-cap-schedule", default="5,5,3,2,1")
@@ -81,7 +97,7 @@ def main():
     if len(width_schedule) != args.depth:
         raise ValueError("width schedule length must equal --depth")
 
-    print("\n[1/5] Loading Fast-dLLM drafter only...", flush=True)
+    print("\n[1/6] Loading Fast-dLLM drafter only...", flush=True)
     drafter_model, drafter_tokenizer = load_local_causal_model(
         args.drafter_model_path,
         dtype=args.drafter_dtype,
@@ -117,7 +133,7 @@ def main():
         max_tree_tokens=args.max_tree_tokens,
         confidence_mode="cumulative_log_score",
     )
-    print("\n[2/5] Building the complete drafter tree before verification...", flush=True)
+    print("\n[2/6] Building the complete drafter tree before verification...", flush=True)
     tree = builder.build(prefix_ids)
     print(f"Tree complete: nodes={len(tree.nodes)} widths={tree.widths()}", flush=True)
     tree_report = build_multi_step_tree_report(
@@ -130,6 +146,16 @@ def main():
         width_schedule=width_schedule,
     )
     save_json(tree_report, args.tree_output)
+    q_table_bytes = sum(
+        node.drafter_marginal_logprobs.numel()
+        * node.drafter_marginal_logprobs.element_size()
+        for node in tree.nodes.values()
+        if node.drafter_marginal_logprobs is not None
+    )
+    print(
+        f"Saved drafter marginal tables on CPU: {q_table_bytes / 2**20:.2f} MiB",
+        flush=True,
+    )
 
     # Phase 1 is complete. Release the drafter before loading Qwen so the one-pass
     # verifier stays on GPU instead of silently offloading layers to CPU.
@@ -142,7 +168,7 @@ def main():
             flush=True,
         )
 
-    print("\n[3/5] Loading Qwen verifier after the tree is complete...", flush=True)
+    print("\n[3/6] Loading Qwen verifier after the tree is complete...", flush=True)
     verifier_model, verifier_tokenizer = load_local_causal_model(
         args.verifier_model_path,
         dtype=args.verifier_dtype,
@@ -150,6 +176,14 @@ def main():
         local_files_only=True,
         allow_model_download=args.allow_model_download,
         attn_implementation="sdpa",
+        max_memory=(
+            {
+                0: f"{args.verifier_max_gpu_memory_gib}GiB",
+                "cpu": f"{args.verifier_max_cpu_memory_gib}GiB",
+            }
+            if args.device_map == "auto" and torch.cuda.is_available()
+            else None
+        ),
     )
     validate_tokenizer_compatibility(
         drafter_tokenizer,
@@ -184,7 +218,25 @@ def main():
         None,
         config,
     )
-    print("\n[4/5] Scoring every tree candidate with ONE ancestor-masked AR forward...", flush=True)
+    union_diagnostics = {"candidate_set_mode": args.candidate_set_mode}
+    if args.candidate_set_mode == "union_topk":
+        print(
+            "\n[4/6] Finding verifier Top-K blocks with batched AR beam search and merging union...",
+            flush=True,
+        )
+        verifier_beams, beam_diagnostics = ARVerifierTopKBlockSearch(
+            verifier_model,
+            block_size=args.block_size,
+            topk=args.verifier_block_topk,
+            batch_size=args.verifier_beam_batch_size,
+        ).search_tree(prefix_ids, tree)
+        union_diagnostics.update(beam_diagnostics)
+        union_diagnostics.update(merge_verifier_topk_into_tree(tree, verifier_beams))
+        print(f"Union candidate construction: {union_diagnostics}", flush=True)
+    else:
+        print("\n[4/6] Skipping verifier Top-K discovery (drafter_topk mode)...", flush=True)
+
+    print("\n[5/6] Scoring every union-tree candidate with ONE ancestor-masked AR forward...", flush=True)
     tree_score = ARTreeScorer(
         verifier_model, logsumexp_row_chunk_size=args.logsumexp_row_chunk_size
     ).score_tree(prefix_ids, tree)
@@ -198,7 +250,7 @@ def main():
         f"full_vocab_logits={tree_score['full_vocabulary_logits_materialized']}",
         flush=True,
     )
-    print("\n[5/5] Sampling over cached p/q values; model calls during traversal = 0...", flush=True)
+    print("\n[6/6] Sampling over cached p/q values; model calls during traversal = 0...", flush=True)
     result = decoder.traverse_precomputed_tree(
         tree, prefix_ids, max_blocks=args.depth,
     )
@@ -206,6 +258,8 @@ def main():
     result["proposal_mode"] = args.proposal_mode
     result["seed"] = args.seed
     result["tree_ar_scoring"] = tree_score
+    result["union_candidate_construction"] = union_diagnostics
+    result["drafter_marginal_tables_cpu_bytes"] = q_table_bytes
     save_json(result, args.output)
     print(f"\nCommitted text: {result['committed_text']!r}", flush=True)
     print(f"Saved verification report: {Path(args.output).resolve()}", flush=True)

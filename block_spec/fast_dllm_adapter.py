@@ -72,7 +72,15 @@ class FastDLLMv2Adapter(DrafterAdapter):
         return torch.log_softmax(selected, dim=-1).cpu()
 
     def propose(self, prefix_ids: torch.LongTensor) -> DraftCandidates:
+        log_probs = self.marginal_log_probs(prefix_ids)
         result = heap_topk_joint(
-            self.marginal_log_probs(prefix_ids), self.per_position_topk, self.num_block_candidates
+            log_probs, self.per_position_topk, self.num_block_candidates
         )
-        return DraftCandidates(result.candidates, result.retained_mass_per_position, result.candidate_mass)
+        return DraftCandidates(
+            result.candidates,
+            result.retained_mass_per_position,
+            result.candidate_mass,
+            # FP16 is sufficient for lookup scoring and halves host-memory use.
+            # Keep this tensor off GPU for the lifetime of the draft tree.
+            log_probs.to(dtype=torch.float16, device="cpu").contiguous(),
+        )

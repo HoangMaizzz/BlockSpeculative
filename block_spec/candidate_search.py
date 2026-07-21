@@ -72,3 +72,21 @@ def brute_force_topk(log_probs: torch.Tensor, per_position_topk: int, n: int) ->
         rows.append((toks, sum(float(values[i, r]) for i, r in enumerate(ranks))))
     return sorted(rows, key=lambda x: (-x[1], x[0]))[:n]
 
+
+def score_block_from_marginals(
+    marginal_log_probs: torch.Tensor,
+    token_ids: tuple[int, ...] | list[int],
+) -> tuple[tuple[float, ...], float]:
+    """Gather factorized drafter q scores for any block from a saved CPU table."""
+    tokens = tuple(int(token_id) for token_id in token_ids)
+    if marginal_log_probs.ndim != 2:
+        raise ValueError("marginal_log_probs must have shape [block_size, vocab_size]")
+    if len(tokens) != marginal_log_probs.shape[0]:
+        raise ValueError("block length does not match the saved drafter marginal table")
+    if any(token_id < 0 or token_id >= marginal_log_probs.shape[1] for token_id in tokens):
+        raise ValueError("block contains a token outside the drafter vocabulary")
+    rows = torch.arange(len(tokens), dtype=torch.long)
+    columns = torch.tensor(tokens, dtype=torch.long)
+    values = marginal_log_probs[rows, columns].float()
+    per_token = tuple(float(value) for value in values)
+    return per_token, float(values.sum())
