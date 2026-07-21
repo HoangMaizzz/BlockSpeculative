@@ -1,0 +1,288 @@
+from __future__ import annotations
+
+import argparse
+import gc
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import time
+
+import torch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from block_spec.decoder import BlockSpeculativeDecoder, sample_logits
+from block_spec.fast_dllm_adapter import FastDLLMv2Adapter
+from block_spec.tokenizer_compatibility import validate_tokenizer_compatibility
+from block_spec.tree_ar_scorer import ARTreeScorer
+from block_spec.tree_builder import AsymmetricTreeBuilder
+from block_spec.verifier_candidate_search import (
+    ARVerifierTopKBlockSearch,
+    merge_verifier_topk_into_tree,
+)
+from block_spec.verifier_loader import load_local_causal_model
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Full multi-round union-TopK block speculative generation"
+    )
+    parser.add_argument("--drafter-model-path", default=os.getenv("DRAFTER_MODEL_PATH"))
+    parser.add_argument("--verifier-model-path", default=os.getenv("VERIFIER_MODEL_PATH"))
+    parser.add_argument("--prompt")
+    parser.add_argument("--prompt-file")
+    parser.add_argument("--system-prompt", default="You are a careful mathematics tutor.")
+    parser.add_argument("--max-new-tokens", type=int, default=126)
+    parser.add_argument("--stop-on-final-answer", action="store_true")
+    parser.add_argument("--block-size", type=int, default=3)
+    parser.add_argument("--num-block-candidates", type=int, default=5)
+    parser.add_argument("--per-position-topk", type=int, default=8)
+    parser.add_argument("--verifier-block-topk", type=int, default=5)
+    parser.add_argument("--verifier-beam-batch-size", type=int, default=4)
+    parser.add_argument("--depth", type=int, default=5)
+    parser.add_argument("--width-schedule", default="5,20,10,5,1")
+    parser.add_argument("--parent-cap-schedule", default="5,5,3,2,1")
+    parser.add_argument("--depth2-min-children-per-parent", type=int, default=2)
+    parser.add_argument("--max-tree-nodes", type=int, default=64)
+    parser.add_argument("--max-tree-tokens", type=int, default=192)
+    parser.add_argument("--native-block-size", type=int, default=32)
+    parser.add_argument("--mask-token-id", type=int, default=151665)
+    parser.add_argument("--proposal-mode", choices=("sample_q", "top1_q"), default="sample_q")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--drafter-dtype", choices=("float16", "bfloat16"), default="float16")
+    parser.add_argument("--verifier-dtype", choices=("float16", "bfloat16"), default="float16")
+    parser.add_argument("--device-map", default="auto")
+    parser.add_argument("--verifier-max-gpu-memory-gib", type=int, default=14)
+    parser.add_argument("--verifier-max-cpu-memory-gib", type=int, default=45)
+    parser.add_argument("--output", default="outputs/full_union_generation.json")
+    parser.add_argument("--allow-model-download", action="store_true")
+    return parser.parse_args()
+
+
+def read_prompt(args) -> str:
+    if bool(args.prompt) == bool(args.prompt_file):
+        raise ValueError("Provide exactly one of --prompt or --prompt-file")
+    text = args.prompt
+    if args.prompt_file:
+        text = Path(args.prompt_file).read_text(encoding="utf-8")
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("Prompt is empty")
+    return text
+
+
+@torch.inference_mode()
+def verifier_one_token(model, prefix: torch.LongTensor, generator: torch.Generator) -> int:
+    device = model.get_input_embeddings().weight.device
+    ids = prefix.reshape(1, -1).to(device)
+    base_model = getattr(model, "model", None)
+    lm_head = getattr(model, "lm_head", None)
+    if base_model is not None and lm_head is not None:
+        output = base_model(input_ids=ids, use_cache=False)
+        logits = lm_head(output.last_hidden_state[:, -1])[0]
+    else:
+        output = model(input_ids=ids, use_cache=False)
+        logits = output.logits[0, -1]
+    return sample_logits(logits, 1.0, None, 1.0, generator)
+
+
+def main():
+    args = parse_args()
+    prompt = read_prompt(args)
+    if not args.drafter_model_path or not args.verifier_model_path:
+        raise ValueError("Set DRAFTER_MODEL_PATH and VERIFIER_MODEL_PATH")
+    widths = [int(value) for value in args.width_schedule.split(",")]
+    parent_caps = [int(value) for value in args.parent_cap_schedule.split(",")]
+    if len(widths) != args.depth:
+        raise ValueError("width schedule length must equal --depth")
+
+    print("[LOAD] Fast-dLLM drafter...", flush=True)
+    drafter_model, drafter_tokenizer = load_local_causal_model(
+        args.drafter_model_path,
+        dtype=args.drafter_dtype,
+        device_map=args.device_map,
+        local_files_only=True,
+        allow_model_download=args.allow_model_download,
+    )
+    print("[LOAD] Qwen verifier...", flush=True)
+    verifier_model, verifier_tokenizer = load_local_causal_model(
+        args.verifier_model_path,
+        dtype=args.verifier_dtype,
+        device_map=args.device_map,
+        local_files_only=True,
+        allow_model_download=args.allow_model_download,
+        attn_implementation="sdpa",
+        max_memory=(
+            {
+                0: f"{args.verifier_max_gpu_memory_gib}GiB",
+                "cpu": f"{args.verifier_max_cpu_memory_gib}GiB",
+            }
+            if args.device_map == "auto" and torch.cuda.is_available()
+            else None
+        ),
+    )
+    validate_tokenizer_compatibility(
+        drafter_tokenizer,
+        verifier_tokenizer,
+        require_compatibility=True,
+        report_path="outputs/tokenizer_compatibility.json",
+    )
+
+    messages = [
+        {"role": "system", "content": args.system_prompt},
+        {"role": "user", "content": prompt},
+    ]
+    prompt_text = drafter_tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    prefix = drafter_tokenizer(prompt_text, return_tensors="pt")["input_ids"].reshape(-1).cpu()
+    prompt_token_count = int(prefix.numel())
+
+    adapter = FastDLLMv2Adapter(
+        drafter_model,
+        drafter_tokenizer,
+        block_size=args.block_size,
+        per_position_topk=args.per_position_topk,
+        num_block_candidates=args.num_block_candidates,
+        mask_token_id=args.mask_token_id,
+        native_block_size=args.native_block_size,
+    )
+    builder = AsymmetricTreeBuilder(
+        adapter,
+        width_schedule=widths,
+        parent_cap_schedule=parent_caps,
+        depth2_min_children_per_parent=args.depth2_min_children_per_parent,
+        max_tree_nodes=args.max_tree_nodes,
+        max_tree_tokens=args.max_tree_tokens,
+        confidence_mode="cumulative_log_score",
+    )
+    verifier_search = ARVerifierTopKBlockSearch(
+        verifier_model,
+        block_size=args.block_size,
+        topk=args.verifier_block_topk,
+        batch_size=args.verifier_beam_batch_size,
+        vocab_limit=len(verifier_tokenizer),
+    )
+    tree_scorer = ARTreeScorer(verifier_model)
+    decoder = BlockSpeculativeDecoder(
+        None,
+        None,
+        verifier_tokenizer,
+        None,
+        {
+            "seed": args.seed,
+            "sampling": {"proposal_mode": args.proposal_mode},
+            "residual": {"epsilon": 1e-12},
+            "logging": {"print_verification_trace": True, "print_candidate_table": True},
+        },
+    )
+    generator = torch.Generator(device="cpu").manual_seed(args.seed)
+    eos = verifier_tokenizer.eos_token_id
+    eos_ids = {eos} if isinstance(eos, int) else set(eos or [])
+    generated: list[int] = []
+    round_reports: list[dict] = []
+    started = time.perf_counter()
+    stop_reason = "max_new_tokens"
+    round_index = 0
+
+    while len(generated) < args.max_new_tokens:
+        remaining = args.max_new_tokens - len(generated)
+        print(
+            f"\n{'#' * 96}\n[FULL ROUND {round_index}] "
+            f"prefix_tokens={prefix.numel()} generated={len(generated)} remaining={remaining}",
+            flush=True,
+        )
+        if remaining < args.block_size:
+            token = verifier_one_token(verifier_model, prefix, generator)
+            generated.append(token)
+            prefix = torch.cat((prefix, torch.tensor([token], dtype=torch.long)))
+            if token in eos_ids:
+                stop_reason = "eos"
+                break
+            round_index += 1
+            continue
+
+        draft_started = time.perf_counter()
+        tree = builder.build(prefix)
+        draft_seconds = time.perf_counter() - draft_started
+        q_table_bytes = sum(
+            node.drafter_marginal_logprobs.numel()
+            * node.drafter_marginal_logprobs.element_size()
+            for node in tree.nodes.values()
+            if node.drafter_marginal_logprobs is not None
+        )
+        print(
+            f"[TREE] nodes={len(tree.nodes)} widths={tree.widths()} "
+            f"q_tables_cpu={q_table_bytes / 2**20:.2f} MiB draft_s={draft_seconds:.2f}",
+            flush=True,
+        )
+
+        beams, beam_report = verifier_search.search_tree(prefix, tree)
+        union_report = merge_verifier_topk_into_tree(tree, beams)
+        score_report = tree_scorer.score_tree(prefix, tree)
+        sampled = decoder.traverse_precomputed_tree(
+            tree,
+            prefix,
+            max_blocks=min(args.depth, remaining // args.block_size),
+        )
+        committed = sampled["committed_token_ids"]
+        if not committed:
+            token = verifier_one_token(verifier_model, prefix, generator)
+            committed = [token]
+            sampled["stop_reason"] = "empty_tree_target_fallback"
+        generated.extend(committed)
+        prefix = torch.cat((prefix, torch.tensor(committed, dtype=torch.long)))
+        round_reports.append(
+            {
+                "round": round_index,
+                "tree_nodes": len(tree.nodes),
+                "tree_widths": tree.widths(),
+                "draft_seconds": draft_seconds,
+                "drafter_marginal_tables_cpu_bytes": q_table_bytes,
+                "verifier_beam": beam_report,
+                "union": union_report,
+                "tree_scoring": score_report,
+                "sampling": sampled,
+            }
+        )
+        generated_text = verifier_tokenizer.decode(generated, skip_special_tokens=True)
+        print(f"[FULL OUTPUT SO FAR]\n{generated_text}", flush=True)
+        if any(token in eos_ids for token in committed):
+            stop_reason = "eos"
+            break
+        if args.stop_on_final_answer and re.search(
+            r"Final answer\s*:\s*[^\s]+", generated_text, flags=re.IGNORECASE
+        ):
+            stop_reason = "final_answer_pattern"
+            break
+        del tree, beams
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        round_index += 1
+
+    if any(token in eos_ids for token in generated):
+        generated = generated[: next(i for i, token in enumerate(generated) if token in eos_ids) + 1]
+    text = verifier_tokenizer.decode(generated, skip_special_tokens=True)
+    result = {
+        "prompt": prompt,
+        "prompt_token_count": prompt_token_count,
+        "generated_token_count": len(generated),
+        "generated_token_ids": generated,
+        "text": text,
+        "stop_reason": stop_reason,
+        "elapsed_seconds": time.perf_counter() - started,
+        "rounds": round_reports,
+    }
+    target = Path(args.output)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"\n{'=' * 96}\nFINAL GENERATED TEXT:\n{text}", flush=True)
+    print(f"Saved: {target.resolve()}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

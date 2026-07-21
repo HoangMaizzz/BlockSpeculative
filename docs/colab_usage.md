@@ -17,3 +17,9 @@ logits are reduced to Top-K immediately. On an L4, the defaults reserve Qwen to
 14 GiB of GPU weight placement and start verifier beam batches at 8; lower
 `--verifier-beam-batch-size` or `--verifier-max-gpu-memory-gib` if another
 notebook allocation is present.
+
+For a complete answer rather than one inspected tree, use
+`scripts/run_union_generation.py`. It keeps the 1.5B drafter and a smaller
+verifier such as Qwen2.5-3B loaded once, then repeats build, union enrichment,
+one-pass tree scoring, and cached residual traversal until EOS, a final-answer
+pattern, or the new-token limit.
