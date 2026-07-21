@@ -47,6 +47,15 @@ Start with `configs/colab_light.yaml` on constrained GPUs. `device_map: auto` pe
 
 CLI model paths override YAML paths; `DRAFTER_MODEL_PATH` and `VERIFIER_MODEL_PATH` are used when CLI paths are absent. Standard Hugging Face `HF_HOME` and `TRANSFORMERS_CACHE` are honored by Transformers. Round JSONL and the tokenizer report are written beneath `outputs/`, which is ignored by Git.
 
+Verification tracing is enabled by default. For every node the terminal prints the shared
+candidate table (`q_S`, `p_S`, residual probability and block text), proposed index,
+acceptance probability `alpha`, uniform sample `u`, ACCEPT/REJECT verdict, residual sample,
+committed block, and whether verification continues to a child. Disable it with:
+
+```bash
+python scripts/run_generation.py ... --disable-verification-trace
+```
+
 The default schedule is `[5, 20, 10, 5, 2, 1]`. The second depth first grants two strong children per depth-1 parent, then fills remaining positions globally. A candidate remains in its parent's residual support even when it has no child node.
 
 See [repository inspection](docs/repository_inspection.md), [algorithm](docs/algorithm.md), [Colab guide](docs/colab_usage.md), and [limitations](docs/limitations.md).

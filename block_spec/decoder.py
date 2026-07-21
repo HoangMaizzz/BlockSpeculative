@@ -40,6 +40,60 @@ class BlockSpeculativeDecoder:
         self.config = config
         self.generator = torch.Generator(device="cpu").manual_seed(int(config.get("seed", 42)))
 
+    def _trace_enabled(self) -> bool:
+        return bool(self.config.get("logging", {}).get("print_verification_trace", False))
+
+    def _block_text(self, token_ids) -> str:
+        try:
+            text = self.tokenizer.decode(list(token_ids), skip_special_tokens=False)
+            return text.replace("\n", "\\n")
+        except Exception:
+            return "<decode unavailable>"
+
+    def _print_node_trace(
+        self, node, decision, q_probs, p_probs, residual, committed, child,
+        raw_q_mass, raw_p_mass, residual_fallback,
+    ) -> None:
+        if not self._trace_enabled():
+            return
+        print("\n" + "=" * 88)
+        print(
+            f"[VERIFY] node={node.node_id} depth={node.depth} candidates={len(node.candidate_set)} "
+            f"mass_q={raw_q_mass:.6g} mass_p={raw_p_mass:.6g}"
+        )
+        if self.config.get("logging", {}).get("print_candidate_table", True):
+            print(" idx  role       q_S         p_S         residual    log_q       log_p       block")
+            for i, candidate in enumerate(node.candidate_set):
+                roles = []
+                if i == decision.proposed_index:
+                    roles.append("PROPOSED")
+                if i == committed:
+                    roles.append("COMMIT")
+                role = "+".join(roles) or "-"
+                residual_value = float(residual[i]) if residual is not None else 0.0
+                print(
+                    f" {i:>3}  {role:<10} {float(q_probs[i]):>10.6f}  {float(p_probs[i]):>10.6f}  "
+                    f"{residual_value:>10.6f}  {candidate.drafter_log_score:>10.4f}  "
+                    f"{float(candidate.verifier_log_score):>10.4f}  {list(candidate.token_ids)} "
+                    f"{self._block_text(candidate.token_ids)!r}"
+                )
+        verdict = "ACCEPT" if decision.accepted else "REJECT"
+        print(
+            f"[DECISION] proposed_index={decision.proposed_index} "
+            f"alpha={decision.acceptance_probability:.6f} u={decision.uniform_sample:.6f} "
+            f"log_alpha={decision.log_acceptance_probability:.6f} => {verdict}"
+        )
+        if not decision.accepted:
+            print(
+                f"[RESIDUAL] sampled_index={committed} fallback_to_p={str(residual_fallback).lower()} "
+                f"probability={float(residual[committed]):.6f}"
+            )
+        print(
+            f"[COMMIT] index={committed} tokens={list(node.candidate_set[committed].token_ids)} "
+            f"text={self._block_text(node.candidate_set[committed].token_ids)!r} "
+            f"next={'child node ' + str(child.node_id) if child is not None else 'stop at leaf'}"
+        )
+
     def _target_token(self, prefix):
         device = self.scorer.device
         with torch.inference_mode():
@@ -63,6 +117,7 @@ class BlockSpeculativeDecoder:
         decision = decide_acceptance(proposed, node.candidate_set[proposed].token_ids, p_probs, q_probs, self.generator)
         residual_used = False
         fallback = False
+        residual = None
         committed = proposed
         if not decision.accepted:
             residual_started = time.perf_counter()
@@ -83,6 +138,10 @@ class BlockSpeculativeDecoder:
         )
         raw_q_mass = sum(math.exp(x) for x in q_logs.tolist())
         raw_p_mass = sum(math.exp(x) for x in p_logs.tolist())
+        self._print_node_trace(
+            node, decision, q_probs, p_probs, residual, committed, child,
+            raw_q_mass, raw_p_mass, fallback,
+        )
         threshold = float(self.config["residual"].get("mass_warning_threshold", 0.95))
         if raw_q_mass < threshold or raw_p_mass < threshold:
             if self.config["residual"].get("strict_mass", False):
@@ -101,7 +160,9 @@ class BlockSpeculativeDecoder:
             "accepted": decision.accepted,
             "acceptance_probability": decision.acceptance_probability,
             "uniform_sample": decision.uniform_sample,
+            "random_seed": int(self.config.get("seed", 42)),
             "residual_used": residual_used,
+            "residual_sampled_candidate_index": committed if residual_used else None,
             "residual_degenerate_fallback": fallback,
             "residual_time_ms": residual_time_ms,
             "committed_block": list(node.candidate_set[committed].token_ids),
@@ -123,6 +184,8 @@ class BlockSpeculativeDecoder:
         eos_ids = {eos_ids} if isinstance(eos_ids, int) else set(eos_ids or [])
         while len(generated) < gc.max_new_tokens and not (generated and generated[-1] in eos_ids):
             remaining = gc.max_new_tokens - len(generated)
+            if self._trace_enabled():
+                print(f"\n[ROUND {round_idx}] prefix_tokens={prefix.numel()} remaining_tokens={remaining}")
             if remaining < self.drafter.block_size:
                 token = self._target_token(prefix.reshape(1, -1))
                 generated.append(token)
@@ -131,6 +194,8 @@ class BlockSpeculativeDecoder:
             draft_start = time.perf_counter()
             tree = self.tree_builder.build(prefix)
             draft_ms = (time.perf_counter() - draft_start) * 1000
+            if self._trace_enabled():
+                print(f"[DRAFT TREE] nodes={len(tree.nodes)} widths={tree.widths()} build_ms={draft_ms:.2f}")
             if not tree.root.candidate_set:
                 if self.config["generation"].get("fallback_mode") != "target_one_token":
                     raise RuntimeError("Drafter returned an empty tree")
@@ -170,12 +235,19 @@ class BlockSpeculativeDecoder:
                 round_log["bonus_token_used"] = True
                 round_log["bonus_additional_verifier_call"] = True
                 round_log["committed_tokens"] += 1
+                if self._trace_enabled():
+                    print(f"[BONUS] token={bonus} text={self._block_text((bonus,))!r} additional_verifier_call=true")
             if round_log["node_results"]:
                 round_log.update({k: v for k, v in round_log["node_results"][0].items() if k in {
                     "candidate_mass_q", "candidate_mass_p", "proposed_block", "accepted", "residual_used",
                     "committed_block", "continued_in_tree"
                 }})
             rounds.append(round_log)
+            if self._trace_enabled():
+                print(
+                    f"[ROUND {round_idx} DONE] committed_tokens={round_log['committed_tokens']} "
+                    f"bonus={str(round_log['bonus_token_used']).lower()} total_generated={len(generated)}"
+                )
             round_idx += 1
         # Trim only after EOS; max length is already enforced at block boundaries.
         if any(t in eos_ids for t in generated):

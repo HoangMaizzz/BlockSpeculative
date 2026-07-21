@@ -47,3 +47,5 @@ logging:
   output_dir: outputs
   save_jsonl: true
   print_tree: true
+  print_verification_trace: true
+  print_candidate_table: true

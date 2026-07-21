@@ -6,5 +6,4 @@ tree: {width_schedule: [2, 2, 1], parent_cap_schedule: [2, 2, 1], depth2_min_chi
 sampling: {proposal_mode: top1_q, temperature: 0.0, top_k: null, top_p: 1.0, enable_bonus_token: true}
 residual: {enabled: true, epsilon: 1.0e-12, degenerate_fallback: sample_p, mass_warning_threshold: 0.95, mass_target_threshold: 0.99}
 generation: {max_new_tokens: 16, fallback_mode: target_one_token}
-logging: {output_dir: outputs, save_jsonl: true, print_tree: true}
-
+logging: {output_dir: outputs, save_jsonl: true, print_tree: true, print_verification_trace: true, print_candidate_table: true}

@@ -5,3 +5,7 @@ Use a GPU runtime. Clone the branch, install `requirements-colab.txt`, and point
 Run `scripts/inspect_models.py` before generation. The 1.5B drafter plus 7B verifier can exceed smaller Colab GPUs in FP16/BF16. Device-map CPU offload and verifier candidate chunking are supported; automatic quantization is intentionally disabled.
 
 The bundled notebook contains diagnostics, clone/install placeholders, path assertions, inspection, smoke test, balanced run, and benchmark cells.
+
+`logging.print_verification_trace` and `logging.print_candidate_table` are enabled in the
+bundled configurations. The same decisions and random seed are persisted in the round JSONL
+file so a run can be audited after Colab finishes.

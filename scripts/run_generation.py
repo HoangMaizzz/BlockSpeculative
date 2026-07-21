@@ -36,6 +36,7 @@ def parser():
     p.add_argument("--proposal-mode", choices=("sample_q", "top1_q"))
     p.add_argument("--output", default=None)
     p.add_argument("--metrics-output", default=None)
+    p.add_argument("--disable-verification-trace", action="store_true")
     return p
 
 
@@ -47,6 +48,8 @@ def build_decoder(args):
         raise ValueError("Set DRAFTER_MODEL_PATH and VERIFIER_MODEL_PATH or pass both CLI paths")
     if args.disable_bonus_token:
         cfg["sampling"]["enable_bonus_token"] = False
+    if args.disable_verification_trace:
+        cfg.setdefault("logging", {})["print_verification_trace"] = False
     if args.block_size:
         cfg["drafter"]["block_size"] = args.block_size
     if args.candidate_count:
