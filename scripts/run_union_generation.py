@@ -43,7 +43,13 @@ def parse_args():
     parser.add_argument(
         "--candidate-set-mode",
         choices=("drafter_topk", "union_topk"),
-        default="drafter_topk",
+        default="union_topk",
+        help=(
+            "Candidate support used for acceptance/residual sampling. "
+            "union_topk (default) uses drafter Top-K union verifier Top-K and "
+            "scores every retained block under both q and p. drafter_topk is "
+            "a faster ablation that cannot sample verifier-only blocks."
+        ),
     )
     parser.add_argument("--verifier-block-topk", type=int, default=5)
     parser.add_argument("--verifier-beam-batch-size", type=int, default=4)
@@ -245,12 +251,16 @@ def main():
         if verifier_search is not None:
             beams, beam_report = verifier_search.search_tree(prefix, tree)
             union_report = merge_verifier_topk_into_tree(tree, beams)
+            union_report["candidate_set_mode"] = "union_topk"
+            union_report["support_definition"] = "drafter_topk_union_verifier_topk"
         else:
             beam_report = {
                 "candidate_set_mode": "drafter_topk",
                 "verifier_forward_calls": 0,
             }
             union_report = {
+                "candidate_set_mode": "drafter_topk",
+                "support_definition": "drafter_topk_only",
                 "verifier_only_blocks_added": 0,
                 "duplicate_blocks_merged": 0,
             }

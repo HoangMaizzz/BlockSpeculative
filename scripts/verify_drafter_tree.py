@@ -38,7 +38,13 @@ def parse_args():
     parser.add_argument("--num-block-candidates", type=int, default=5)
     parser.add_argument("--per-position-topk", type=int, default=8)
     parser.add_argument(
-        "--candidate-set-mode", choices=("drafter_topk", "union_topk"), default="union_topk"
+        "--candidate-set-mode",
+        choices=("drafter_topk", "union_topk"),
+        default="union_topk",
+        help=(
+            "union_topk scores the union of drafter and verifier Top-K blocks "
+            "under both models; drafter_topk is a strict one-pass ablation."
+        ),
     )
     parser.add_argument("--verifier-block-topk", type=int, default=5)
     parser.add_argument("--verifier-beam-batch-size", type=int, default=8)
