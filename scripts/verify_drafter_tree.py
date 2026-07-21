@@ -192,7 +192,10 @@ def main():
         f"Tree AR scoring complete: forward_calls={tree_score['verifier_forward_calls']} "
         f"candidate_blocks={tree_score['tree_candidate_blocks_scored']} "
         f"flattened_length={tree_score['flattened_sequence_length']} "
-        f"mask_shape={tree_score['attention_mask_shape']}",
+        f"mask_shape={tree_score['attention_mask_shape']} "
+        f"restricted_lm_head={tree_score['restricted_lm_head']} "
+        f"projected_logits={tree_score['projected_logit_count']} "
+        f"full_vocab_logits={tree_score['full_vocabulary_logits_materialized']}",
         flush=True,
     )
     print("\n[5/5] Sampling over cached p/q values; model calls during traversal = 0...", flush=True)

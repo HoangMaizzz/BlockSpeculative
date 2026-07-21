@@ -90,7 +90,12 @@ def build_tree_attention_layout(prefix_ids: torch.LongTensor, tree) -> TreeAtten
 
 
 class ARTreeScorer:
-    """Score every candidate block in a prebuilt tree with one AR forward."""
+    """Score prebuilt candidates in their local retained probability space.
+
+    At every tree node, the retained candidate tokens at a block offset are
+    treated as the complete local support.  This is the intended top-k
+    approximation: no full-vocabulary softmax is materialized.
+    """
 
     def __init__(self, model, logsumexp_row_chunk_size: int = 32):
         self.model = model
@@ -114,35 +119,111 @@ class ARTreeScorer:
         )
         additive_mask.masked_fill_(layout.allowed_attention.to(device), 0.0)
         additive_mask = additive_mask.unsqueeze(0).unsqueeze(0)
-        output = self.model(
-            input_ids=layout.input_ids.to(device),
-            attention_mask=additive_mask,
-            position_ids=layout.position_ids.to(device),
-            use_cache=False,
-        )
-        logits = output.logits[0]
         prediction_positions: list[int] = []
         target_token_ids: list[int] = []
+        retained_token_sets: list[tuple[int, ...]] = []
         edge_slices: list[tuple[int, int]] = []
         cursor = 0
         for edge in layout.edges:
+            node = tree.nodes[edge.parent_node_id]
             tokens = layout.input_ids[0, edge.start:edge.end].tolist()
             positions = [edge.context_last_position, *range(edge.start, edge.end - 1)]
             prediction_positions.extend(positions)
             target_token_ids.extend(tokens)
+            for offset in range(len(tokens)):
+                # Deduplicate shared token IDs: probability mass belongs to a
+                # token, not to the number of candidate blocks containing it.
+                retained_token_sets.append(
+                    tuple(dict.fromkeys(candidate.token_ids[offset] for candidate in node.candidate_set))
+                )
             edge_slices.append((cursor, cursor + len(tokens)))
             cursor += len(tokens)
-        prediction_tensor = torch.tensor(prediction_positions, dtype=torch.long, device=logits.device)
-        target_tensor = torch.tensor(target_token_ids, dtype=torch.long, device=logits.device)
-        unique_positions, inverse = torch.unique(prediction_tensor, sorted=True, return_inverse=True)
-        denominators = torch.empty(unique_positions.numel(), dtype=torch.float32, device=logits.device)
-        for start in range(0, unique_positions.numel(), self.logsumexp_row_chunk_size):
-            positions = unique_positions[start : start + self.logsumexp_row_chunk_size]
-            denominators[start : start + positions.numel()] = torch.logsumexp(
-                logits.index_select(0, positions).float(), dim=-1
+        prediction_cpu = torch.tensor(prediction_positions, dtype=torch.long)
+        base_model = getattr(self.model, "model", None)
+        lm_head = getattr(self.model, "lm_head", None)
+        used_restricted_lm_head = base_model is not None and lm_head is not None
+        projected_logit_count = sum(len(values) for values in retained_token_sets)
+        if used_restricted_lm_head:
+            # The transformer processes the complete masked tree exactly once.
+            # The output projection below gathers only IDs already retained in
+            # the tree (normally <= 5 per local node), never the full vocabulary.
+            base_output = base_model(
+                input_ids=layout.input_ids.to(device),
+                attention_mask=additive_mask,
+                position_ids=layout.position_ids.to(device),
+                use_cache=False,
             )
-        target_logits = logits[prediction_tensor, target_tensor].float()
-        token_logprobs = (target_logits - denominators[inverse]).cpu()
+            hidden_states = base_output.last_hidden_state[0]
+            hook = getattr(lm_head, "_hf_hook", None)
+            output_weight = lm_head.weight
+            if output_weight.device.type == "meta":
+                weights_map = getattr(hook, "weights_map", None)
+                if weights_map is None:
+                    raise RuntimeError("Cannot access the offloaded lm_head weight map")
+                output_weight = weights_map["weight"]
+            output_bias = lm_head.bias
+            if output_bias is not None and output_bias.device.type == "meta":
+                output_bias = hook.weights_map["bias"]
+
+            flat_retained_ids: list[int] = []
+            repeated_occurrences: list[int] = []
+            segment_slices: list[tuple[int, int]] = []
+            target_offsets: list[int] = []
+            flat_cursor = 0
+            for occurrence, (target, retained) in enumerate(
+                zip(target_token_ids, retained_token_sets)
+            ):
+                if target not in retained:
+                    raise RuntimeError("Target token is absent from its retained support")
+                flat_retained_ids.extend(retained)
+                repeated_occurrences.extend([occurrence] * len(retained))
+                segment_slices.append((flat_cursor, flat_cursor + len(retained)))
+                target_offsets.append(retained.index(target))
+                flat_cursor += len(retained)
+
+            weight_ids = torch.tensor(flat_retained_ids, dtype=torch.long, device=output_weight.device)
+            selected_weight = output_weight.index_select(0, weight_ids).to(hidden_states.device)
+            occurrence_ids = torch.tensor(
+                repeated_occurrences, dtype=torch.long, device=hidden_states.device
+            )
+            selected_positions = prediction_cpu.index_select(
+                0, occurrence_ids.cpu()
+            ).to(hidden_states.device)
+            selected_hidden = hidden_states.index_select(0, selected_positions)
+            retained_logits = (selected_hidden.float() * selected_weight.float()).sum(dim=-1)
+            if output_bias is not None:
+                selected_bias = output_bias.index_select(0, weight_ids).to(hidden_states.device)
+                retained_logits += selected_bias.float()
+            token_logprobs = torch.empty(prediction_cpu.numel(), dtype=torch.float32)
+            for occurrence, ((start, end), target_offset) in enumerate(
+                zip(segment_slices, target_offsets)
+            ):
+                local_logits = retained_logits[start:end]
+                token_logprobs[occurrence] = (
+                    local_logits[target_offset] - torch.logsumexp(local_logits, dim=0)
+                ).cpu()
+            del base_output, hidden_states, selected_hidden, selected_weight, retained_logits
+        else:
+            # Generic fallback for custom models that do not expose the base
+            # transformer and output weights. It selects the same retained IDs
+            # from the returned logits; production Qwen never enters this path.
+            output = self.model(
+                input_ids=layout.input_ids.to(device),
+                attention_mask=additive_mask,
+                position_ids=layout.position_ids.to(device),
+                use_cache=False,
+            )
+            logits = output.logits[0]
+            token_logprobs = torch.empty(prediction_cpu.numel(), dtype=torch.float32)
+            for occurrence, (position, target, retained) in enumerate(
+                zip(prediction_positions, target_token_ids, retained_token_sets)
+            ):
+                retained_ids = torch.tensor(retained, dtype=torch.long, device=logits.device)
+                local_logits = logits[position].index_select(0, retained_ids).float()
+                token_logprobs[occurrence] = (
+                    local_logits[retained.index(target)] - torch.logsumexp(local_logits, dim=0)
+                ).cpu()
+            del output, logits
         for edge, (start, end) in zip(layout.edges, edge_slices):
             candidate = tree.nodes[edge.parent_node_id].candidate_set[edge.candidate_index]
             values = token_logprobs[start:end]
@@ -174,7 +255,11 @@ class ARTreeScorer:
             "tree_candidate_blocks_scored": len(layout.edges),
             "tree_candidate_tokens_scored": sum(edge.end - edge.start for edge in layout.edges),
             "attention_mask_shape": list(additive_mask.shape),
+            "probability_space": "retained_tree_tokens_per_node_and_block_offset",
+            "full_vocabulary_logits_materialized": False if used_restricted_lm_head else True,
+            "restricted_lm_head": used_restricted_lm_head,
+            "projected_logit_count": projected_logit_count,
             "node_statistics": node_statistics,
         }
-        del output, logits, additive_mask, denominators, target_logits
+        del additive_mask
         return result

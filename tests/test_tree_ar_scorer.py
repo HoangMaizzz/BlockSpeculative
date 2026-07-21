@@ -39,6 +39,33 @@ class TinyTreeModel(torch.nn.Module):
         return SimpleNamespace(logits=self.head(self.embed(input_ids)))
 
 
+class TinyBaseModel(torch.nn.Module):
+    def __init__(self, embed):
+        super().__init__()
+        self.embed = embed
+        self.forward_calls = 0
+
+    def forward(self, input_ids, attention_mask=None, position_ids=None, use_cache=False):
+        self.forward_calls += 1
+        assert attention_mask is not None and attention_mask.ndim == 4
+        assert position_ids is not None
+        return SimpleNamespace(last_hidden_state=self.embed(input_ids))
+
+
+class TinyCausalLM(torch.nn.Module):
+    def __init__(self, vocab=12):
+        super().__init__()
+        self.embed = torch.nn.Embedding(vocab, 6)
+        self.model = TinyBaseModel(self.embed)
+        self.lm_head = torch.nn.Linear(6, vocab, bias=False)
+
+    def get_input_embeddings(self):
+        return self.embed
+
+    def forward(self, *args, **kwargs):
+        raise AssertionError("top-level causal-LM forward must not materialize full-tree logits")
+
+
 def test_tree_mask_allows_ancestors_but_blocks_siblings():
     drafter = TwoCandidateDrafter()
     tree = AsymmetricTreeBuilder(
@@ -71,6 +98,27 @@ def test_tree_scorer_uses_one_forward_and_populates_every_candidate():
     assert result["verifier_forward_calls"] == 1
     expected = sum(len(node.candidate_set) for node in tree.nodes.values())
     assert result["tree_candidate_blocks_scored"] == expected
+    for node in tree.nodes.values():
+        if not node.candidate_set:
+            continue
+        assert all(candidate.verifier_log_score is not None for candidate in node.candidate_set)
+        assert abs(sum(candidate.p_normalized for candidate in node.candidate_set) - 1.0) < 1e-6
+
+
+def test_tree_scorer_runs_transformer_once_and_restricts_lm_head_to_tree_tokens():
+    drafter = TwoCandidateDrafter()
+    tree = AsymmetricTreeBuilder(
+        drafter, [2, 1], [2, 1], 0, max_tree_nodes=4, max_tree_tokens=6
+    ).build(torch.tensor([1, 2]))
+    model = TinyCausalLM()
+    result = ARTreeScorer(model, logsumexp_row_chunk_size=1).score_tree(
+        torch.tensor([1, 2]), tree
+    )
+    assert model.model.forward_calls == 1
+    assert result["verifier_forward_calls"] == 1
+    assert result["restricted_lm_head"] is True
+    assert result["full_vocabulary_logits_materialized"] is False
+    assert result["probability_space"] == "retained_tree_tokens_per_node_and_block_offset"
     for node in tree.nodes.values():
         if not node.candidate_set:
             continue
