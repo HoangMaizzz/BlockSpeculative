@@ -13,8 +13,9 @@ class DraftCandidates:
     candidates: list[BlockCandidate]
     retained_mass_per_position: tuple[float, ...]
     candidate_mass: float
-    # Full q_i(token) table retained on CPU so verifier-only blocks can be
-    # scored later without another drafter call. Shape: [block_size, vocab].
+    # Full q_i(token) table retained on the drafter device so verifier-only
+    # blocks can be scored later without another drafter call.
+    # Shape: [block_size, vocab].
     marginal_log_probs: torch.Tensor | None = None
 
 

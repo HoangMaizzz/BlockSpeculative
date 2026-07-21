@@ -9,7 +9,7 @@
 7. The optional bonus token does not determine residual correctness.
 8. `union_topk` uses finite AR beam search, so verifier Top-K block discovery is
    an approximation rather than exhaustive search over `vocab_size ** block_size`.
-9. Retained Fast-dLLM marginal tables are stored in FP16 on CPU; verifier-only
+9. Retained Fast-dLLM marginal tables are stored in FP16 on the drafter device; verifier-only
    drafter scores therefore have FP16 lookup precision.
 8. Tree drafting currently recomputes remote-code forwards rather than sharing Fast-dLLM cache objects across divergent branches.
 9. No quantization is enabled; comparisons must use the same precision.

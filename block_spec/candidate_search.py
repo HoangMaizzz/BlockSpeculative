@@ -77,7 +77,7 @@ def score_block_from_marginals(
     marginal_log_probs: torch.Tensor,
     token_ids: tuple[int, ...] | list[int],
 ) -> tuple[tuple[float, ...], float]:
-    """Gather factorized drafter q scores for any block from a saved CPU table."""
+    """Gather factorized drafter q scores for any block from a saved table."""
     tokens = tuple(int(token_id) for token_id in token_ids)
     if marginal_log_probs.ndim != 2:
         raise ValueError("marginal_log_probs must have shape [block_size, vocab_size]")
@@ -85,8 +85,8 @@ def score_block_from_marginals(
         raise ValueError("block length does not match the saved drafter marginal table")
     if any(token_id < 0 or token_id >= marginal_log_probs.shape[1] for token_id in tokens):
         raise ValueError("block contains a token outside the drafter vocabulary")
-    rows = torch.arange(len(tokens), dtype=torch.long)
-    columns = torch.tensor(tokens, dtype=torch.long)
+    rows = torch.arange(len(tokens), dtype=torch.long, device=marginal_log_probs.device)
+    columns = torch.tensor(tokens, dtype=torch.long, device=marginal_log_probs.device)
     values = marginal_log_probs[rows, columns].float()
     per_token = tuple(float(value) for value in values)
     return per_token, float(values.sum())

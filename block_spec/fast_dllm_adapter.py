@@ -69,7 +69,7 @@ class FastDLLMv2Adapter(DrafterAdapter):
         selected = shifted[0, start : start + self.block_size].float()
         if selected.shape[0] != self.block_size:
             raise RuntimeError("Fast-dLLM did not return a complete masked block")
-        return torch.log_softmax(selected, dim=-1).cpu()
+        return torch.log_softmax(selected, dim=-1)
 
     def propose(self, prefix_ids: torch.LongTensor) -> DraftCandidates:
         log_probs = self.marginal_log_probs(prefix_ids)
@@ -80,7 +80,7 @@ class FastDLLMv2Adapter(DrafterAdapter):
             result.candidates,
             result.retained_mass_per_position,
             result.candidate_mass,
-            # FP16 is sufficient for lookup scoring and halves host-memory use.
-            # Keep this tensor off GPU for the lifetime of the draft tree.
-            log_probs.to(dtype=torch.float16, device="cpu").contiguous(),
+            # FP16 keeps the complete lookup table small. Retain it beside the
+            # drafter so verifier-only union blocks require no full-table host transfer.
+            log_probs.to(dtype=torch.float16).contiguous(),
         )

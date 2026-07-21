@@ -153,7 +153,7 @@ def main():
         if node.drafter_marginal_logprobs is not None
     )
     print(
-        f"Saved drafter marginal tables on CPU: {q_table_bytes / 2**20:.2f} MiB",
+        f"Saved drafter marginal tables on {adapter.device}: {q_table_bytes / 2**20:.2f} MiB",
         flush=True,
     )
 
@@ -260,7 +260,12 @@ def main():
     result["seed"] = args.seed
     result["tree_ar_scoring"] = tree_score
     result["union_candidate_construction"] = union_diagnostics
-    result["drafter_marginal_tables_cpu_bytes"] = q_table_bytes
+    result["drafter_marginal_tables_device"] = str(next(
+        node.drafter_marginal_logprobs.device
+        for node in tree.nodes.values()
+        if node.drafter_marginal_logprobs is not None
+    ))
+    result["drafter_marginal_tables_bytes"] = q_table_bytes
     save_json(result, args.output)
     print(f"\nCommitted text: {result['committed_text']!r}", flush=True)
     print(f"Saved verification report: {Path(args.output).resolve()}", flush=True)

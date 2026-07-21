@@ -216,7 +216,8 @@ def main():
         )
         print(
             f"[TREE] nodes={len(tree.nodes)} widths={tree.widths()} "
-            f"q_tables_cpu={q_table_bytes / 2**20:.2f} MiB draft_s={draft_seconds:.2f}",
+            f"q_tables_device={adapter.device} q_tables={q_table_bytes / 2**20:.2f} MiB "
+            f"draft_s={draft_seconds:.2f}",
             flush=True,
         )
 
@@ -251,7 +252,8 @@ def main():
                 "tree_nodes": len(tree.nodes),
                 "tree_widths": tree.widths(),
                 "draft_seconds": draft_seconds,
-                "drafter_marginal_tables_cpu_bytes": q_table_bytes,
+                "drafter_marginal_tables_device": str(adapter.device),
+                "drafter_marginal_tables_bytes": q_table_bytes,
                 "verifier_beam": beam_report,
                 "union": union_report,
                 "tree_scoring": score_report,
