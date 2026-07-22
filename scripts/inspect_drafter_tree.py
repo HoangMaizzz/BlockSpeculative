@@ -16,6 +16,7 @@ from block_spec.drafter_tree_inspection import (
     save_first_step_tree_report,
 )
 from block_spec.fast_dllm_adapter import FastDLLMv2Adapter
+from block_spec.prompting import PROMPT_STYLES, build_messages, render_chat_prompt
 from block_spec.tree_builder import AsymmetricTreeBuilder
 from block_spec.verifier_loader import load_local_causal_model
 
@@ -28,6 +29,7 @@ def parse_args():
     parser.add_argument("--prompt")
     parser.add_argument("--prompt-file")
     parser.add_argument("--system-prompt", default="You are a careful mathematics tutor.")
+    parser.add_argument("--prompt-style", choices=PROMPT_STYLES, default="system_user")
     parser.add_argument("--block-size", type=int, default=3)
     parser.add_argument("--num-block-candidates", type=int, default=5)
     parser.add_argument("--per-position-topk", type=int, default=8)
@@ -74,13 +76,12 @@ def main():
         local_files_only=True,
         allow_model_download=args.allow_model_download,
     )
-    messages = [
-        {"role": "system", "content": args.system_prompt},
-        {"role": "user", "content": prompt},
-    ]
-    prompt_text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
+    messages = build_messages(
+        prompt,
+        prompt_style=args.prompt_style,
+        system_prompt=args.system_prompt,
     )
+    prompt_text = render_chat_prompt(tokenizer, messages)
     prefix_ids = tokenizer(prompt_text, return_tensors="pt")["input_ids"].reshape(-1)
     adapter = FastDLLMv2Adapter(
         model=model,

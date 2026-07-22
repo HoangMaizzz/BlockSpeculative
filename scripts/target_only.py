@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 
+from block_spec.prompting import PROMPT_STYLES, build_messages, render_chat_prompt
 from block_spec.verifier_loader import load_local_causal_model
 
 
@@ -20,6 +21,7 @@ def main():
     p.add_argument("--prompt")
     p.add_argument("--prompt-file")
     p.add_argument("--system-prompt", default="You are a careful mathematics tutor.")
+    p.add_argument("--prompt-style", choices=PROMPT_STYLES, default="system_user")
     p.add_argument("--max-new-tokens", type=int, default=128)
     p.add_argument("--dtype", default="float16")
     p.add_argument("--metrics-output")
@@ -34,14 +36,12 @@ def main():
     model, tokenizer = load_local_causal_model(
         args.verifier_model_path, dtype=args.dtype, attn_implementation="sdpa"
     )
-    prompt = tokenizer.apply_chat_template(
-        [
-            {"role": "system", "content": args.system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        tokenize=False,
-        add_generation_prompt=True,
+    messages = build_messages(
+        user_prompt,
+        prompt_style=args.prompt_style,
+        system_prompt=args.system_prompt,
     )
+    prompt = render_chat_prompt(tokenizer, messages)
     ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(model.get_input_embeddings().weight.device)
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
@@ -56,7 +56,9 @@ def main():
     count = output.shape[1] - ids.shape[1]
     generated_text = tokenizer.decode(output[0, ids.shape[1]:], skip_special_tokens=True)
     print(generated_text)
-    metrics = {"mode": "target_only", "elapsed_seconds": elapsed, "generated_tokens": count,
+    metrics = {"mode": "target_only", "prompt_style": args.prompt_style,
+               "prompt_messages": messages, "rendered_prompt": prompt,
+               "elapsed_seconds": elapsed, "generated_tokens": count,
                "tokens_per_second": count / max(elapsed, 1e-9),
                "peak_allocated_gpu_memory": torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0,
                "peak_reserved_gpu_memory": torch.cuda.max_memory_reserved() if torch.cuda.is_available() else 0}

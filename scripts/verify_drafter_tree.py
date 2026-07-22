@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT))
 from block_spec.decoder import BlockSpeculativeDecoder
 from block_spec.drafter_tree_inspection import build_multi_step_tree_report
 from block_spec.fast_dllm_adapter import FastDLLMv2Adapter
+from block_spec.prompting import PROMPT_STYLES, build_messages, render_chat_prompt
 from block_spec.tokenizer_compatibility import validate_tokenizer_compatibility
 from block_spec.tree_ar_scorer import ARTreeScorer
 from block_spec.tree_builder import AsymmetricTreeBuilder
@@ -34,6 +35,7 @@ def parse_args():
     parser.add_argument("--prompt")
     parser.add_argument("--prompt-file")
     parser.add_argument("--system-prompt", default="You are a careful mathematics tutor.")
+    parser.add_argument("--prompt-style", choices=PROMPT_STYLES, default="system_user")
     parser.add_argument("--block-size", type=int, default=3)
     parser.add_argument("--num-block-candidates", type=int, default=5)
     parser.add_argument("--per-position-topk", type=int, default=8)
@@ -125,15 +127,15 @@ def main():
         local_files_only=True,
         allow_model_download=args.allow_model_download,
     )
-    messages = [
-        {"role": "system", "content": args.system_prompt},
-        {"role": "user", "content": prompt},
-    ]
-    prompt_text = drafter_tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
+    messages = build_messages(
+        prompt,
+        prompt_style=args.prompt_style,
+        system_prompt=args.system_prompt,
     )
+    prompt_text = render_chat_prompt(drafter_tokenizer, messages)
     prefix_ids = drafter_tokenizer(prompt_text, return_tensors="pt")["input_ids"].reshape(-1)
     print(f"Prompt received: {prompt!r}", flush=True)
+    print(f"Prompt style: {args.prompt_style}; roles={[item['role'] for item in messages]}", flush=True)
     print(f"Prompt token count: {prefix_ids.numel()}", flush=True)
     adapter = FastDLLMv2Adapter(
         drafter_model,

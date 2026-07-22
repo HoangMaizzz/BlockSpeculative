@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT))
 
 from block_spec.decoder import BlockSpeculativeDecoder, sample_logits
 from block_spec.fast_dllm_adapter import FastDLLMv2Adapter
+from block_spec.prompting import PROMPT_STYLES, build_messages, render_chat_prompt
 from block_spec.tokenizer_compatibility import validate_tokenizer_compatibility
 from block_spec.tree_ar_scorer import ARTreeScorer
 from block_spec.tree_builder import AsymmetricTreeBuilder
@@ -35,6 +36,16 @@ def parse_args():
     parser.add_argument("--prompt")
     parser.add_argument("--prompt-file")
     parser.add_argument("--system-prompt", default="You are a careful mathematics tutor.")
+    parser.add_argument(
+        "--prompt-style",
+        choices=PROMPT_STYLES,
+        default="system_user",
+        help=(
+            "failfast_math sends one user-only message containing the FailFast "
+            "math instruction plus the raw problem; system_user keeps the normal "
+            "separate system and user messages."
+        ),
+    )
     parser.add_argument("--max-new-tokens", type=int, default=126)
     parser.add_argument("--stop-on-final-answer", action="store_true")
     parser.add_argument("--block-size", type=int, default=3)
@@ -174,15 +185,19 @@ def main():
         report_path="outputs/tokenizer_compatibility.json",
     )
 
-    messages = [
-        {"role": "system", "content": args.system_prompt},
-        {"role": "user", "content": prompt},
-    ]
-    prompt_text = drafter_tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
+    messages = build_messages(
+        prompt,
+        prompt_style=args.prompt_style,
+        system_prompt=args.system_prompt,
     )
+    prompt_text = render_chat_prompt(drafter_tokenizer, messages)
     prefix = drafter_tokenizer(prompt_text, return_tensors="pt")["input_ids"].reshape(-1).cpu()
     prompt_token_count = int(prefix.numel())
+    print(
+        f"[PROMPT] style={args.prompt_style} roles={[item['role'] for item in messages]} "
+        f"tokens={prompt_token_count}",
+        flush=True,
+    )
 
     adapter = FastDLLMv2Adapter(
         drafter_model,
@@ -483,6 +498,9 @@ def main():
     }
     result = {
         "prompt": prompt,
+        "prompt_style": args.prompt_style,
+        "prompt_messages": messages,
+        "rendered_prompt": prompt_text,
         "prompt_token_count": prompt_token_count,
         "generated_token_count": len(generated),
         "generated_token_ids": generated,
