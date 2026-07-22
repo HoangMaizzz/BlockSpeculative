@@ -139,6 +139,7 @@ def test_full_vocab_normalization_reports_real_union_mass():
     ).score_tree(torch.tensor([1, 2]), tree)
     assert model.model.forward_calls == 1
     assert result["coverage_is_full_vocab_exact"] is True
-    assert result["probability_space"] == "full_verifier_vocabulary"
+    assert result["probability_space"] == "retained_tree_tokens_per_node_and_block_offset"
+    assert result["coverage_seconds"] >= 0.0
     for statistics in result["node_statistics"]:
         assert 0.0 <= statistics["raw_candidate_mass_p"] <= 1.0 + 1e-6

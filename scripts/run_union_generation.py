@@ -303,7 +303,9 @@ def main():
         score_started = time.perf_counter()
         score_report = tree_scorer.score_tree(prefix, tree)
         sync_cuda()
-        tree_score_seconds = time.perf_counter() - score_started
+        tree_scoring_total_seconds = time.perf_counter() - score_started
+        coverage_seconds = float(score_report.get("coverage_seconds", 0.0))
+        tree_score_seconds = max(0.0, tree_scoring_total_seconds - coverage_seconds)
         node_coverage = score_report["node_statistics"]
         mean_q_coverage = sum(
             item["raw_candidate_mass_q"] for item in node_coverage
@@ -369,7 +371,9 @@ def main():
             f"replacement_blocks={sampled['replacement_blocks']} "
             f"committed_tokens={len(committed)} "
             f"draft_s={draft_seconds:.3f} beam_s={beam_seconds:.3f} "
-            f"tree_verify_s={tree_score_seconds:.3f} sampling_s={sampling_seconds:.6f} "
+            f"tree_verify_s={tree_score_seconds:.3f} coverage_s={coverage_seconds:.3f} "
+            f"tree_plus_coverage_s={tree_scoring_total_seconds:.3f} "
+            f"sampling_s={sampling_seconds:.6f} "
             f"round_s={round_seconds:.3f} round_tok_s={round_tokens_per_second:.3f} "
             f"cumulative_tok_s={cumulative_tokens_per_second:.3f} "
             f"stop_reason={sampled['stop_reason']}",
@@ -383,6 +387,8 @@ def main():
                 "draft_seconds": draft_seconds,
                 "verifier_beam_seconds": beam_seconds,
                 "tree_verification_seconds": tree_score_seconds,
+                "coverage_seconds": coverage_seconds,
+                "tree_scoring_total_seconds": tree_scoring_total_seconds,
                 "sampling_seconds": sampling_seconds,
                 "round_seconds": round_seconds,
                 "round_tokens_per_second": round_tokens_per_second,
@@ -444,6 +450,12 @@ def main():
         "mean_tree_verification_seconds": sum(
             report["tree_verification_seconds"] for report in round_reports
         ) / max(timed_rounds, 1),
+        "mean_coverage_seconds": sum(
+            report["coverage_seconds"] for report in round_reports
+        ) / max(timed_rounds, 1),
+        "mean_tree_scoring_total_seconds": sum(
+            report["tree_scoring_total_seconds"] for report in round_reports
+        ) / max(timed_rounds, 1),
         "mean_sampling_seconds": sum(
             report["sampling_seconds"] for report in round_reports
         ) / max(timed_rounds, 1),
@@ -452,14 +464,19 @@ def main():
         ) / max(timed_rounds, 1),
     }
     coverage_rounds = [report["union_coverage"] for report in round_reports]
+    total_coverage_nodes = sum(report["node_count"] for report in coverage_rounds)
     union_coverage_summary = {
         "rounds": len(coverage_rounds),
+        "nodes": total_coverage_nodes,
+        "averaging": "node_weighted_across_all_rounds",
         "drafter_mean": sum(
-            report["drafter_mean"] for report in coverage_rounds
-        ) / max(len(coverage_rounds), 1),
+            report["drafter_mean"] * report["node_count"]
+            for report in coverage_rounds
+        ) / max(total_coverage_nodes, 1),
         "verifier_mean": sum(
-            report["verifier_mean"] for report in coverage_rounds
-        ) / max(len(coverage_rounds), 1),
+            report["verifier_mean"] * report["node_count"]
+            for report in coverage_rounds
+        ) / max(total_coverage_nodes, 1),
         "verifier_coverage_exact": all(
             report["verifier_coverage_exact"] for report in coverage_rounds
         ) if coverage_rounds else False,
@@ -504,6 +521,8 @@ def main():
         f"tree_build_s={timing_summary['mean_tree_build_seconds']:.3f} "
         f"verifier_topk_s={timing_summary['mean_verifier_topk_seconds']:.3f} "
         f"tree_verify_s={timing_summary['mean_tree_verification_seconds']:.3f} "
+        f"coverage_s={timing_summary['mean_coverage_seconds']:.3f} "
+        f"tree_plus_coverage_s={timing_summary['mean_tree_scoring_total_seconds']:.3f} "
         f"sampling_s={timing_summary['mean_sampling_seconds']:.6f} "
         f"round_s={timing_summary['mean_round_seconds']:.3f}",
         flush=True,

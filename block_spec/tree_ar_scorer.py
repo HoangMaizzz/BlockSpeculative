@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import time
 
 import torch
 
@@ -154,6 +155,8 @@ class ARTreeScorer:
         lm_head = getattr(self.model, "lm_head", None)
         used_restricted_lm_head = base_model is not None and lm_head is not None
         projected_logit_count = sum(len(values) for values in retained_token_sets)
+        coverage_seconds = 0.0
+        coverage_token_logprobs = None
         if used_restricted_lm_head:
             # The transformer processes the complete masked tree exactly once.
             # The output projection below gathers only IDs already retained in
@@ -217,6 +220,10 @@ class ARTreeScorer:
                 # Compute exact target log-probabilities a few prediction rows
                 # at a time. This bounds peak logits memory while preserving the
                 # full-vocabulary denominator needed for true coverage metrics.
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                coverage_started = time.perf_counter()
+                coverage_token_logprobs = torch.empty_like(token_logprobs)
                 all_prediction_hidden = hidden_states.index_select(
                     0, prediction_cpu.to(hidden_states.device)
                 )
@@ -233,11 +240,14 @@ class ARTreeScorer:
                     ).float()
                     targets = target_cpu[row_start:row_end].to(full_logits.device)
                     target_logits = full_logits.gather(1, targets.unsqueeze(1)).squeeze(1)
-                    token_logprobs[row_start:row_end] = (
+                    coverage_token_logprobs[row_start:row_end] = (
                         target_logits - torch.logsumexp(full_logits, dim=-1)
                     ).cpu()
                     del full_logits, target_logits
                 del all_prediction_hidden
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                coverage_seconds = time.perf_counter() - coverage_started
             del base_output, hidden_states, selected_hidden, selected_weight, retained_logits
         else:
             # Generic fallback for custom models that do not expose the base
@@ -251,26 +261,39 @@ class ARTreeScorer:
             )
             logits = output.logits[0]
             token_logprobs = torch.empty(prediction_cpu.numel(), dtype=torch.float32)
+            if self.probability_normalization == "full_vocab":
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                coverage_started = time.perf_counter()
+                coverage_token_logprobs = torch.empty_like(token_logprobs)
             for occurrence, (position, target, retained) in enumerate(
                 zip(prediction_positions, target_token_ids, retained_token_sets)
             ):
                 if self.probability_normalization == "full_vocab":
                     full_logits = logits[position].float()
-                    token_logprobs[occurrence] = (
+                    coverage_token_logprobs[occurrence] = (
                         full_logits[target] - torch.logsumexp(full_logits, dim=0)
                     ).cpu()
-                else:
-                    retained_ids = torch.tensor(retained, dtype=torch.long, device=logits.device)
-                    local_logits = logits[position].index_select(0, retained_ids).float()
-                    token_logprobs[occurrence] = (
-                        local_logits[retained.index(target)] - torch.logsumexp(local_logits, dim=0)
-                    ).cpu()
+                retained_ids = torch.tensor(retained, dtype=torch.long, device=logits.device)
+                local_logits = logits[position].index_select(0, retained_ids).float()
+                token_logprobs[occurrence] = (
+                    local_logits[retained.index(target)] - torch.logsumexp(local_logits, dim=0)
+                ).cpu()
+            if self.probability_normalization == "full_vocab":
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                coverage_seconds = time.perf_counter() - coverage_started
             del output, logits
+        coverage_block_logs: dict[tuple[int, int], float] = {}
         for edge, (start, end) in zip(layout.edges, edge_slices):
             candidate = tree.nodes[edge.parent_node_id].candidate_set[edge.candidate_index]
             values = token_logprobs[start:end]
             candidate.verifier_token_logprobs = tuple(float(value) for value in values)
             candidate.verifier_log_score = float(values.sum())
+            if coverage_token_logprobs is not None:
+                coverage_block_logs[(edge.parent_node_id, edge.candidate_index)] = float(
+                    coverage_token_logprobs[start:end].sum()
+                )
         node_statistics = []
         for node in sorted(tree.nodes.values(), key=lambda item: item.node_id):
             if not node.candidate_set:
@@ -288,7 +311,20 @@ class ARTreeScorer:
                     "depth": node.depth,
                     "candidate_count": len(node.candidate_set),
                     "raw_candidate_mass_q": sum(math.exp(float(value)) for value in q_logs),
-                    "raw_candidate_mass_p": sum(math.exp(float(value)) for value in p_logs),
+                    "raw_candidate_mass_p": (
+                        sum(
+                            math.exp(coverage_block_logs[(node.node_id, index)])
+                            for index in range(len(node.candidate_set))
+                        )
+                        if coverage_token_logprobs is not None
+                        else sum(math.exp(float(value)) for value in p_logs)
+                    ),
+                    "sampling_probability_space": "retained_union",
+                    "coverage_probability_space": (
+                        "full_verifier_vocabulary"
+                        if coverage_token_logprobs is not None
+                        else "retained_union"
+                    ),
                 }
             )
         result = {
@@ -297,13 +333,10 @@ class ARTreeScorer:
             "tree_candidate_blocks_scored": len(layout.edges),
             "tree_candidate_tokens_scored": sum(edge.end - edge.start for edge in layout.edges),
             "attention_mask_shape": list(additive_mask.shape),
-            "probability_space": (
-                "full_verifier_vocabulary"
-                if self.probability_normalization == "full_vocab"
-                else "retained_tree_tokens_per_node_and_block_offset"
-            ),
+            "probability_space": "retained_tree_tokens_per_node_and_block_offset",
             "probability_normalization": self.probability_normalization,
             "coverage_is_full_vocab_exact": self.probability_normalization == "full_vocab",
+            "coverage_seconds": coverage_seconds,
             "logsumexp_row_chunk_size": self.logsumexp_row_chunk_size,
             "full_vocabulary_logits_materialized": False if used_restricted_lm_head else True,
             "restricted_lm_head": used_restricted_lm_head,
