@@ -64,6 +64,15 @@ def parse_args():
     parser.add_argument("--native-block-size", type=int, default=32)
     parser.add_argument("--mask-token-id", type=int, default=151665)
     parser.add_argument("--proposal-mode", choices=("sample_q", "top1_q"), default="sample_q")
+    parser.add_argument(
+        "--acceptance-mode",
+        choices=("ratio", "self_selection"),
+        default="ratio",
+        help=(
+            "ratio uses min(1,p/q); self_selection accepts with normalized "
+            "verifier block probability on the retained union support."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--drafter-dtype", choices=("float16", "bfloat16", "float32"), default="float16")
     parser.add_argument("--verifier-dtype", choices=("float16", "bfloat16", "float32"), default="float16")
@@ -201,6 +210,7 @@ def main():
         "seed": args.seed,
         "sampling": {
             "proposal_mode": args.proposal_mode,
+            "acceptance_mode": args.acceptance_mode,
             "temperature": 1.0,
             "top_k": None,
             "top_p": 1.0,

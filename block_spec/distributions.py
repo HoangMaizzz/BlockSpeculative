@@ -35,3 +35,27 @@ def compute_residual_distribution(
     else:
         fallback = fallback / fallback_total
     return fallback, True
+
+
+def compute_self_selection_replacement(
+    p_probs: torch.Tensor, rejected_index: int, eps: float = 1e-12
+) -> tuple[torch.Tensor, bool]:
+    """Return ``P(. | candidate != rejected)`` on retained block support."""
+    if p_probs.ndim != 1 or p_probs.numel() == 0:
+        raise ValueError("p_probs must be a non-empty vector")
+    if rejected_index < 0 or rejected_index >= p_probs.numel():
+        raise IndexError("rejected_index is outside p_probs")
+    replacement = p_probs.float().clamp_min(0).clone()
+    replacement[rejected_index] = 0.0
+    total = replacement.sum()
+    if torch.isfinite(total) and total.item() > eps:
+        return replacement / total, False
+
+    # This branch is reachable only through numerical degeneracy: if P(B)=1,
+    # Bernoulli(P(B)) cannot reject B. Keep the rejected block excluded whenever
+    # at least one alternative candidate exists.
+    if replacement.numel() > 1:
+        replacement.fill_(1.0)
+        replacement[rejected_index] = 0.0
+        return replacement / replacement.sum(), True
+    return torch.ones_like(replacement), True

@@ -31,3 +31,32 @@ def decide_acceptance(
         math.exp(log_alpha), uniform, math.log(uniform) <= log_alpha,
     )
 
+
+def decide_self_selection_acceptance(
+    proposed_index: int,
+    proposed_block: tuple[int, ...],
+    p_probs: torch.Tensor,
+    q_probs: torch.Tensor,
+    generator: torch.Generator,
+) -> AcceptanceDecision:
+    """Accept a proposed block with its normalized verifier probability.
+
+    Together with verifier sampling conditioned on rejecting this exact block,
+    this preserves ``p_probs`` on the retained union support.  ``q_probs`` is
+    recorded for diagnostics only; it does not enter the acceptance ratio.
+    """
+    probability = float(p_probs[proposed_index].clamp(0.0, 1.0))
+    q_probability = float(q_probs[proposed_index].clamp_min(0.0))
+    log_p = math.log(probability) if probability > 0.0 else -math.inf
+    log_q = math.log(q_probability) if q_probability > 0.0 else -math.inf
+    uniform = float(torch.rand((), generator=generator))
+    return AcceptanceDecision(
+        proposed_index,
+        proposed_block,
+        log_p,
+        log_q,
+        log_p,
+        probability,
+        uniform,
+        uniform <= probability,
+    )

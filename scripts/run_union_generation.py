@@ -62,6 +62,16 @@ def parse_args():
     parser.add_argument("--native-block-size", type=int, default=32)
     parser.add_argument("--mask-token-id", type=int, default=151665)
     parser.add_argument("--proposal-mode", choices=("sample_q", "top1_q"), default="sample_q")
+    parser.add_argument(
+        "--acceptance-mode",
+        choices=("ratio", "self_selection"),
+        default="ratio",
+        help=(
+            "ratio uses min(1,p/q) and positive-part residual sampling; "
+            "self_selection accepts with p_S(block) and samples P_S conditioned "
+            "on not choosing the rejected block."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--drafter-dtype", choices=("float16", "bfloat16"), default="float16")
     parser.add_argument("--verifier-dtype", choices=("float16", "bfloat16"), default="float16")
@@ -192,7 +202,10 @@ def main():
         None,
         {
             "seed": args.seed,
-            "sampling": {"proposal_mode": args.proposal_mode},
+            "sampling": {
+                "proposal_mode": args.proposal_mode,
+                "acceptance_mode": args.acceptance_mode,
+            },
             "residual": {"epsilon": 1e-12},
             "logging": {"print_verification_trace": True, "print_candidate_table": True},
         },
@@ -295,6 +308,7 @@ def main():
             f"accepted_blocks={sampled['accepted_blocks']} "
             f"rejected_blocks={sampled['rejected_blocks']} "
             f"residual_blocks={sampled['residual_blocks']} "
+            f"replacement_blocks={sampled['replacement_blocks']} "
             f"committed_tokens={len(committed)} "
             f"draft_s={draft_seconds:.3f} beam_s={beam_seconds:.3f} "
             f"tree_verify_s={tree_score_seconds:.3f} sampling_s={sampling_seconds:.6f} "
@@ -358,6 +372,9 @@ def main():
     total_residual_blocks = sum(
         report["sampling"]["residual_blocks"] for report in round_reports
     )
+    total_replacement_blocks = sum(
+        report["sampling"]["replacement_blocks"] for report in round_reports
+    )
     result = {
         "prompt": prompt,
         "prompt_token_count": prompt_token_count,
@@ -377,6 +394,7 @@ def main():
         "total_accepted_blocks": total_accepted_blocks,
         "total_rejected_blocks": total_rejected_blocks,
         "total_residual_blocks": total_residual_blocks,
+        "total_replacement_blocks": total_replacement_blocks,
         "rounds": round_reports,
     }
     target = Path(args.output)

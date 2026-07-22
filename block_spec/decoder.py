@@ -8,9 +8,17 @@ from pathlib import Path
 
 import torch
 
-from .acceptance import decide_acceptance, select_proposal
+from .acceptance import (
+    decide_acceptance,
+    decide_self_selection_acceptance,
+    select_proposal,
+)
 from .config import GenerationConfig
-from .distributions import compute_residual_distribution, normalize_log_scores
+from .distributions import (
+    compute_residual_distribution,
+    compute_self_selection_replacement,
+    normalize_log_scores,
+)
 from .types import GenerationResult, NodeVerificationResult
 
 
@@ -50,6 +58,27 @@ class BlockSpeculativeDecoder:
         except Exception:
             return "<decode unavailable>"
 
+    def _acceptance_mode(self) -> str:
+        mode = self.config.get("sampling", {}).get("acceptance_mode", "ratio")
+        if mode not in {"ratio", "self_selection"}:
+            raise ValueError(f"Unsupported acceptance mode: {mode}")
+        return mode
+
+    def _decide_block(self, proposed, proposed_block, p_probs, q_probs):
+        if self._acceptance_mode() == "self_selection":
+            return decide_self_selection_acceptance(
+                proposed, proposed_block, p_probs, q_probs, self.generator
+            )
+        return decide_acceptance(
+            proposed, proposed_block, p_probs, q_probs, self.generator
+        )
+
+    def _rejection_distribution(self, p_probs, q_probs, proposed):
+        epsilon = float(self.config["residual"].get("epsilon", 1e-12))
+        if self._acceptance_mode() == "self_selection":
+            return compute_self_selection_replacement(p_probs, proposed, epsilon)
+        return compute_residual_distribution(p_probs, q_probs, epsilon)
+
     def _print_node_trace(
         self, node, decision, q_probs, p_probs, residual, committed, child,
         raw_q_mass, raw_p_mass, residual_fallback,
@@ -59,6 +88,7 @@ class BlockSpeculativeDecoder:
         print("\n" + "=" * 88)
         print(
             f"[VERIFY] node={node.node_id} depth={node.depth} candidates={len(node.candidate_set)} "
+            f"acceptance_mode={self._acceptance_mode()} "
             f"mass_q={raw_q_mass:.6g} mass_p={raw_p_mass:.6g}"
         )
         if self.config.get("logging", {}).get("print_candidate_table", True):
@@ -85,8 +115,12 @@ class BlockSpeculativeDecoder:
             f"log_alpha={decision.log_acceptance_probability:.6f} => {verdict}"
         )
         if not decision.accepted:
+            distribution_name = (
+                "REPLACEMENT" if self._acceptance_mode() == "self_selection" else "RESIDUAL"
+            )
             print(
-                f"[RESIDUAL] sampled_index={committed} fallback_to_p={str(residual_fallback).lower()} "
+                f"[{distribution_name}] sampled_index={committed} "
+                f"degenerate_fallback={str(residual_fallback).lower()} "
                 f"probability={float(residual[committed]):.6f}"
             )
         print(
@@ -115,15 +149,17 @@ class BlockSpeculativeDecoder:
             candidate.p_normalized = float(p_probs[i])
         mode = self.config["sampling"].get("proposal_mode", "sample_q")
         proposed = select_proposal(q_probs, mode, self.generator)
-        decision = decide_acceptance(proposed, node.candidate_set[proposed].token_ids, p_probs, q_probs, self.generator)
+        decision = self._decide_block(
+            proposed, node.candidate_set[proposed].token_ids, p_probs, q_probs
+        )
         residual_used = False
         fallback = False
         residual = None
         committed = proposed
         if not decision.accepted:
             residual_started = time.perf_counter()
-            residual, fallback = compute_residual_distribution(
-                p_probs, q_probs, float(self.config["residual"].get("epsilon", 1e-12))
+            residual, fallback = self._rejection_distribution(
+                p_probs, q_probs, proposed
             )
             committed = int(torch.multinomial(residual, 1, generator=self.generator))
             for i, candidate in enumerate(node.candidate_set):
@@ -153,6 +189,12 @@ class BlockSpeculativeDecoder:
                 f"Truncated support retains q={raw_q_mass:.4g}, p={raw_p_mass:.4g}; values are not full-space coverage proofs"
             )
         diagnostics = {
+            "acceptance_mode": self._acceptance_mode(),
+            "rejection_distribution": (
+                "verifier_conditioned_not_proposed"
+                if self._acceptance_mode() == "self_selection"
+                else "positive_part_p_minus_q"
+            ),
             "candidate_mass_q": raw_q_mass,
             "candidate_mass_p": raw_p_mass,
             "one_minus_drafter_mass": max(0.0, 1.0 - raw_q_mass),
@@ -184,8 +226,8 @@ class BlockSpeculativeDecoder:
         proposed = select_proposal(
             q_probs, self.config["sampling"].get("proposal_mode", "sample_q"), self.generator
         )
-        decision = decide_acceptance(
-            proposed, node.candidate_set[proposed].token_ids, p_probs, q_probs, self.generator
+        decision = self._decide_block(
+            proposed, node.candidate_set[proposed].token_ids, p_probs, q_probs
         )
         residual = None
         residual_used = False
@@ -194,8 +236,8 @@ class BlockSpeculativeDecoder:
         residual_started = None
         if not decision.accepted:
             residual_started = time.perf_counter()
-            residual, fallback = compute_residual_distribution(
-                p_probs, q_probs, float(self.config["residual"].get("epsilon", 1e-12))
+            residual, fallback = self._rejection_distribution(
+                p_probs, q_probs, proposed
             )
             committed = int(torch.multinomial(residual, 1, generator=self.generator))
             residual_used = True
@@ -218,6 +260,12 @@ class BlockSpeculativeDecoder:
             None if child is not None else "committed_candidate_is_unexpanded_leaf",
         )
         diagnostics = {
+            "acceptance_mode": self._acceptance_mode(),
+            "rejection_distribution": (
+                "verifier_conditioned_not_proposed"
+                if self._acceptance_mode() == "self_selection"
+                else "positive_part_p_minus_q"
+            ),
             "candidate_mass_q": raw_q_mass,
             "candidate_mass_p": raw_p_mass,
             "proposed_block": list(node.candidate_set[proposed].token_ids),
@@ -297,7 +345,11 @@ class BlockSpeculativeDecoder:
         accepted_blocks = sum(bool(item["accepted"]) for item in decisions)
         rejected_blocks = sum(not bool(item["accepted"]) for item in decisions)
         residual_blocks = sum(bool(item["residual_used"]) for item in decisions)
+        replacement_blocks = (
+            residual_blocks if self._acceptance_mode() == "self_selection" else 0
+        )
         summary = {
+            "acceptance_mode": self._acceptance_mode(),
             "tree_nodes": len(tree.nodes),
             "tree_widths": tree.widths(),
             "visited_node_ids": visited_node_ids,
@@ -305,6 +357,7 @@ class BlockSpeculativeDecoder:
             "accepted_blocks": accepted_blocks,
             "rejected_blocks": rejected_blocks,
             "residual_blocks": residual_blocks,
+            "replacement_blocks": replacement_blocks,
             "committed_token_ids": committed_tokens,
             "committed_text": self.tokenizer.decode(committed_tokens, skip_special_tokens=True),
             "stop_reason": stop_reason,
@@ -316,6 +369,7 @@ class BlockSpeculativeDecoder:
                 f"[PRECOMPUTED TREE DONE] visited={visited_node_ids} "
                 f"committed={blocks_committed} accepted={accepted_blocks} "
                 f"rejected={rejected_blocks} residual={residual_blocks} "
+                f"replacement={replacement_blocks} "
                 f"stop_reason={stop_reason} text={summary['committed_text']!r}",
                 flush=True,
             )
