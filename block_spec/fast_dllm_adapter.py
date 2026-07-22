@@ -54,20 +54,39 @@ class FastDLLMv2Adapter(DrafterAdapter):
 
     @torch.inference_mode()
     def marginal_log_probs(self, prefix_ids: torch.LongTensor) -> torch.Tensor:
-        prefix = prefix_ids.reshape(1, -1).to(self.device)
+        return self.marginal_log_probs_batch([prefix_ids])[0]
+
+    @torch.inference_mode()
+    def marginal_log_probs_batch(
+        self, prefix_ids: list[torch.LongTensor]
+    ) -> torch.Tensor:
+        """Score equal-length prefixes in one Fast-dLLM masked forward."""
+        if not prefix_ids:
+            raise ValueError("prefix_ids must be non-empty")
+        lengths = {int(prefix.reshape(-1).numel()) for prefix in prefix_ids}
+        if len(lengths) != 1:
+            raise ValueError("batched Fast-dLLM prefixes must have equal lengths")
+        prefix = torch.stack(
+            [item.reshape(-1).long() for item in prefix_ids], dim=0
+        ).to(self.device)
         remaining = self.native_block_size - (prefix.shape[1] % self.native_block_size)
         if remaining < self.block_size:
             # Complete the current native block before taking the next fixed block.
             remaining += self.native_block_size
-        masks = torch.full((1, remaining), self.mask_token_id, dtype=torch.long, device=self.device)
+        masks = torch.full(
+            (prefix.shape[0], remaining),
+            self.mask_token_id,
+            dtype=torch.long,
+            device=self.device,
+        )
         model_input = torch.cat((prefix, masks), dim=1)
         output = self.model(input_ids=model_input, use_cache=False, block_size=self.native_block_size)
         logits = output.logits
         # This is the same token shift used by the official v2 generate method.
         shifted = torch.cat((logits[:, :1, :], logits[:, :-1, :]), dim=1)
         start = prefix.shape[1]
-        selected = shifted[0, start : start + self.block_size].float()
-        if selected.shape[0] != self.block_size:
+        selected = shifted[:, start : start + self.block_size].float()
+        if selected.shape[1] != self.block_size:
             raise RuntimeError("Fast-dLLM did not return a complete masked block")
         return torch.log_softmax(selected, dim=-1)
 

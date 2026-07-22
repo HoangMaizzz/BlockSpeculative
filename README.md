@@ -43,6 +43,32 @@ python scripts/target_only.py \
 
 Start with `configs/colab_light.yaml` on constrained GPUs. `device_map: auto` permits Transformers offload; verifier candidates are automatically retried in smaller chunks after CUDA OOM. Quantization is deliberately not enabled.
 
+## Fast-dLLM drafter + Fast-dLLM verifier
+
+`run_dual_diffusion_generation.py` keeps the same prebuilt-tree, union-TopK,
+accept/reject, and residual-sampling pipeline, but replaces AR verification with
+Fast-dLLM masked-block marginals. Both models define a block score as the product
+of the per-position probabilities from one fully masked block. Verifier nodes of
+equal prefix length are batched, and all verifier tables are cached before tree
+traversal.
+
+```bash
+python -u scripts/run_dual_diffusion_generation.py \
+  --drafter-model-path "$DRAFTER_MODEL_PATH" \
+  --verifier-model-path "$VERIFIER_MODEL_PATH" \
+  --prompt "Natalia sold 48 clips in April and half as many in May. How many did she sell altogether?" \
+  --system-prompt "You are a careful mathematics tutor. Solve accurately step by step." \
+  --candidate-set-mode union_topk \
+  --block-size 3 --num-block-candidates 5 --verifier-block-topk 5 \
+  --per-position-topk 8 --verifier-per-position-topk 8 \
+  --depth 3 --width-schedule 5,15,15 --parent-cap-schedule 5,5,5 \
+  --verifier-node-batch-size 4 --max-new-tokens 126 \
+  --stop-on-final-answer --output outputs/full_dual_diffusion_generation.json
+```
+
+Here `VERIFIER_MODEL_PATH` must point to a Fast-dLLM model such as
+`Efficient-Large-Model/Fast_dLLM_v2_7B`, not an ordinary AR Qwen checkpoint.
+
 ## Configuration and outputs
 
 CLI model paths override YAML paths; `DRAFTER_MODEL_PATH` and `VERIFIER_MODEL_PATH` are used when CLI paths are absent. Standard Hugging Face `HF_HOME` and `TRANSFORMERS_CACHE` are honored by Transformers. Round JSONL and the tokenizer report are written beneath `outputs/`, which is ignored by Git.

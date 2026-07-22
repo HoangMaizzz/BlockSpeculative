@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from block_spec.decoder import BlockSpeculativeDecoder, sample_logits
+from block_spec.dllm_verifier import FastDLLMVerifier
 from block_spec.fast_dllm_adapter import FastDLLMv2Adapter
 from block_spec.prompting import PROMPT_STYLES, build_messages, render_chat_prompt
 from block_spec.tokenizer_compatibility import validate_tokenizer_compatibility
@@ -63,6 +64,16 @@ def parse_args():
         ),
     )
     parser.add_argument("--verifier-block-topk", type=int, default=5)
+    parser.add_argument(
+        "--verifier-backend",
+        choices=("ar", "fast_dllm"),
+        default="ar",
+        help="AR teacher-forced verifier or Fast-dLLM masked-marginal verifier.",
+    )
+    parser.add_argument("--verifier-per-position-topk", type=int, default=8)
+    parser.add_argument("--verifier-native-block-size", type=int, default=32)
+    parser.add_argument("--verifier-mask-token-id", type=int, default=151665)
+    parser.add_argument("--verifier-node-batch-size", type=int, default=4)
     parser.add_argument("--verifier-beam-batch-size", type=int, default=4)
     parser.add_argument(
         "--probability-normalization",
@@ -129,7 +140,17 @@ def contains_final_answer(text: str) -> bool:
 
 
 @torch.inference_mode()
-def verifier_one_token(model, prefix: torch.LongTensor, generator: torch.Generator) -> int:
+def verifier_one_token(
+    model,
+    prefix: torch.LongTensor,
+    generator: torch.Generator,
+    dllm_adapter=None,
+) -> int:
+    if dllm_adapter is not None:
+        # A dLLM fallback is the first marginal of a newly masked block, not an
+        # AR next-token distribution.
+        log_probs = dllm_adapter.marginal_log_probs(prefix)[0]
+        return sample_logits(log_probs, 1.0, None, 1.0, generator)
     device = model.get_input_embeddings().weight.device
     ids = prefix.reshape(1, -1).to(device)
     base_model = getattr(model, "model", None)
@@ -161,14 +182,17 @@ def main():
         local_files_only=True,
         allow_model_download=args.allow_model_download,
     )
-    print("[LOAD] Qwen verifier...", flush=True)
+    print(
+        f"[LOAD] {'Fast-dLLM' if args.verifier_backend == 'fast_dllm' else 'AR'} verifier...",
+        flush=True,
+    )
     verifier_model, verifier_tokenizer = load_local_causal_model(
         args.verifier_model_path,
         dtype=args.verifier_dtype,
         device_map=args.device_map,
         local_files_only=True,
         allow_model_download=args.allow_model_download,
-        attn_implementation="sdpa",
+        attn_implementation="sdpa" if args.verifier_backend == "ar" else None,
         max_memory=(
             {
                 0: f"{args.verifier_max_gpu_memory_gib}GiB",
@@ -217,20 +241,41 @@ def main():
         max_tree_tokens=args.max_tree_tokens,
         confidence_mode="cumulative_log_score",
     )
+    verifier_adapter = None
     verifier_search = None
-    if args.candidate_set_mode == "union_topk":
-        verifier_search = ARVerifierTopKBlockSearch(
+    if args.verifier_backend == "fast_dllm":
+        verifier_adapter = FastDLLMv2Adapter(
             verifier_model,
+            verifier_tokenizer,
             block_size=args.block_size,
-            topk=args.verifier_block_topk,
-            batch_size=args.verifier_beam_batch_size,
-            vocab_limit=len(verifier_tokenizer),
+            per_position_topk=args.verifier_per_position_topk,
+            num_block_candidates=args.verifier_block_topk,
+            mask_token_id=args.verifier_mask_token_id,
+            native_block_size=args.verifier_native_block_size,
         )
-    tree_scorer = ARTreeScorer(
-        verifier_model,
-        logsumexp_row_chunk_size=args.logsumexp_row_chunk_size,
-        probability_normalization=args.probability_normalization,
-    )
+        dllm_verifier = FastDLLMVerifier(
+            verifier_adapter,
+            topk=args.verifier_block_topk,
+            per_position_topk=args.verifier_per_position_topk,
+            node_batch_size=args.verifier_node_batch_size,
+        )
+        tree_scorer = dllm_verifier
+        if args.candidate_set_mode == "union_topk":
+            verifier_search = dllm_verifier
+    else:
+        if args.candidate_set_mode == "union_topk":
+            verifier_search = ARVerifierTopKBlockSearch(
+                verifier_model,
+                block_size=args.block_size,
+                topk=args.verifier_block_topk,
+                batch_size=args.verifier_beam_batch_size,
+                vocab_limit=len(verifier_tokenizer),
+            )
+        tree_scorer = ARTreeScorer(
+            verifier_model,
+            logsumexp_row_chunk_size=args.logsumexp_row_chunk_size,
+            probability_normalization=args.probability_normalization,
+        )
     decoder = BlockSpeculativeDecoder(
         None,
         None,
@@ -268,7 +313,9 @@ def main():
             flush=True,
         )
         if remaining < args.block_size:
-            token = verifier_one_token(verifier_model, prefix, generator)
+            token = verifier_one_token(
+                verifier_model, prefix, generator, verifier_adapter
+            )
             generated.append(token)
             prefix = torch.cat((prefix, torch.tensor([token], dtype=torch.long)))
             if token in eos_ids:
@@ -295,6 +342,8 @@ def main():
         )
 
         beams = None
+        if args.verifier_backend == "fast_dllm":
+            tree_scorer.clear_cache()
         sync_cuda()
         beam_started = time.perf_counter()
         if verifier_search is not None:
@@ -367,7 +416,9 @@ def main():
         sampling_seconds = time.perf_counter() - sampling_started
         committed = sampled["committed_token_ids"]
         if not committed:
-            token = verifier_one_token(verifier_model, prefix, generator)
+            token = verifier_one_token(
+                verifier_model, prefix, generator, verifier_adapter
+            )
             committed = [token]
             sampled["stop_reason"] = "empty_tree_target_fallback"
         generated.extend(committed)
@@ -498,6 +549,7 @@ def main():
     }
     result = {
         "prompt": prompt,
+        "verifier_backend": args.verifier_backend,
         "prompt_style": args.prompt_style,
         "prompt_messages": messages,
         "rendered_prompt": prompt_text,
