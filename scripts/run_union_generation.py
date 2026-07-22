@@ -110,6 +110,13 @@ def sync_cuda():
         torch.cuda.synchronize()
 
 
+def contains_final_answer(text: str) -> bool:
+    return bool(
+        re.search(r"Final answer\s*:\s*[^\s]+", text, flags=re.IGNORECASE)
+        or re.search(r"\\boxed\s*\{[^{}]+\}", text)
+    )
+
+
 @torch.inference_mode()
 def verifier_one_token(model, prefix: torch.LongTensor, generator: torch.Generator) -> int:
     device = model.get_input_embeddings().weight.device
@@ -394,9 +401,7 @@ def main():
         if any(token in eos_ids for token in committed):
             stop_reason = "eos"
             break
-        if args.stop_on_final_answer and re.search(
-            r"Final answer\s*:\s*[^\s]+", generated_text, flags=re.IGNORECASE
-        ):
+        if args.stop_on_final_answer and contains_final_answer(generated_text):
             stop_reason = "final_answer_pattern"
             break
         del tree
