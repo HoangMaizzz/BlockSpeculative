@@ -53,6 +53,16 @@ def parse_args():
     )
     parser.add_argument("--verifier-block-topk", type=int, default=5)
     parser.add_argument("--verifier-beam-batch-size", type=int, default=4)
+    parser.add_argument(
+        "--probability-normalization",
+        choices=("retained", "full_vocab"),
+        default="retained",
+        help=(
+            "full_vocab computes exact verifier union coverage with chunked "
+            "LM-head log-normalizers; retained is faster but cannot prove coverage."
+        ),
+    )
+    parser.add_argument("--logsumexp-row-chunk-size", type=int, default=8)
     parser.add_argument("--depth", type=int, default=3)
     parser.add_argument("--width-schedule", default="5,15,15")
     parser.add_argument("--parent-cap-schedule", default="5,5,5")
@@ -194,7 +204,11 @@ def main():
             batch_size=args.verifier_beam_batch_size,
             vocab_limit=len(verifier_tokenizer),
         )
-    tree_scorer = ARTreeScorer(verifier_model)
+    tree_scorer = ARTreeScorer(
+        verifier_model,
+        logsumexp_row_chunk_size=args.logsumexp_row_chunk_size,
+        probability_normalization=args.probability_normalization,
+    )
     decoder = BlockSpeculativeDecoder(
         None,
         None,
@@ -283,6 +297,43 @@ def main():
         score_report = tree_scorer.score_tree(prefix, tree)
         sync_cuda()
         tree_score_seconds = time.perf_counter() - score_started
+        node_coverage = score_report["node_statistics"]
+        mean_q_coverage = sum(
+            item["raw_candidate_mass_q"] for item in node_coverage
+        ) / max(len(node_coverage), 1)
+        mean_p_coverage = sum(
+            item["raw_candidate_mass_p"] for item in node_coverage
+        ) / max(len(node_coverage), 1)
+        coverage_report = {
+            "node_count": len(node_coverage),
+            "drafter_mean": mean_q_coverage,
+            "drafter_min": min(
+                (item["raw_candidate_mass_q"] for item in node_coverage),
+                default=0.0,
+            ),
+            "drafter_max": max(
+                (item["raw_candidate_mass_q"] for item in node_coverage),
+                default=0.0,
+            ),
+            "verifier_mean": mean_p_coverage,
+            "verifier_min": min(
+                (item["raw_candidate_mass_p"] for item in node_coverage),
+                default=0.0,
+            ),
+            "verifier_max": max(
+                (item["raw_candidate_mass_p"] for item in node_coverage),
+                default=0.0,
+            ),
+            "verifier_coverage_exact": score_report["coverage_is_full_vocab_exact"],
+        }
+        coverage_label = "exact" if coverage_report["verifier_coverage_exact"] else "retained-space"
+        print(
+            f"[UNION COVERAGE] nodes={len(node_coverage)} "
+            f"q_mean={mean_q_coverage * 100:.3f}% "
+            f"p_mean={mean_p_coverage * 100:.3f}% "
+            f"p_measurement={coverage_label}",
+            flush=True,
+        )
         sampling_started = time.perf_counter()
         sampled = decoder.traverse_precomputed_tree(
             tree,
@@ -334,6 +385,7 @@ def main():
                 "verifier_beam": beam_report,
                 "union": union_report,
                 "tree_scoring": score_report,
+                "union_coverage": coverage_report,
                 "sampling": sampled,
             }
         )
@@ -375,6 +427,38 @@ def main():
     total_replacement_blocks = sum(
         report["sampling"]["replacement_blocks"] for report in round_reports
     )
+    timed_rounds = len(round_reports)
+    timing_summary = {
+        "rounds": timed_rounds,
+        "mean_tree_build_seconds": sum(
+            report["draft_seconds"] for report in round_reports
+        ) / max(timed_rounds, 1),
+        "mean_verifier_topk_seconds": sum(
+            report["verifier_beam_seconds"] for report in round_reports
+        ) / max(timed_rounds, 1),
+        "mean_tree_verification_seconds": sum(
+            report["tree_verification_seconds"] for report in round_reports
+        ) / max(timed_rounds, 1),
+        "mean_sampling_seconds": sum(
+            report["sampling_seconds"] for report in round_reports
+        ) / max(timed_rounds, 1),
+        "mean_round_seconds": sum(
+            report["round_seconds"] for report in round_reports
+        ) / max(timed_rounds, 1),
+    }
+    coverage_rounds = [report["union_coverage"] for report in round_reports]
+    union_coverage_summary = {
+        "rounds": len(coverage_rounds),
+        "drafter_mean": sum(
+            report["drafter_mean"] for report in coverage_rounds
+        ) / max(len(coverage_rounds), 1),
+        "verifier_mean": sum(
+            report["verifier_mean"] for report in coverage_rounds
+        ) / max(len(coverage_rounds), 1),
+        "verifier_coverage_exact": all(
+            report["verifier_coverage_exact"] for report in coverage_rounds
+        ) if coverage_rounds else False,
+    }
     result = {
         "prompt": prompt,
         "prompt_token_count": prompt_token_count,
@@ -395,6 +479,8 @@ def main():
         "total_rejected_blocks": total_rejected_blocks,
         "total_residual_blocks": total_residual_blocks,
         "total_replacement_blocks": total_replacement_blocks,
+        "timing_summary": timing_summary,
+        "union_coverage_summary": union_coverage_summary,
         "rounds": round_reports,
     }
     target = Path(args.output)
@@ -406,6 +492,22 @@ def main():
         f"tokens_per_second={result['tokens_per_second']:.3f} "
         f"peak_allocated_gib={result['peak_allocated_gpu_memory_bytes'] / 2**30:.3f} "
         f"peak_reserved_gib={result['peak_reserved_gpu_memory_bytes'] / 2**30:.3f}",
+        flush=True,
+    )
+    print(
+        "[AVERAGE ROUND TIME] "
+        f"tree_build_s={timing_summary['mean_tree_build_seconds']:.3f} "
+        f"verifier_topk_s={timing_summary['mean_verifier_topk_seconds']:.3f} "
+        f"tree_verify_s={timing_summary['mean_tree_verification_seconds']:.3f} "
+        f"sampling_s={timing_summary['mean_sampling_seconds']:.6f} "
+        f"round_s={timing_summary['mean_round_seconds']:.3f}",
+        flush=True,
+    )
+    print(
+        "[AVERAGE UNION COVERAGE] "
+        f"q={union_coverage_summary['drafter_mean'] * 100:.3f}% "
+        f"p={union_coverage_summary['verifier_mean'] * 100:.3f}% "
+        f"p_exact={str(union_coverage_summary['verifier_coverage_exact']).lower()}",
         flush=True,
     )
     print(f"Saved: {target.resolve()}", flush=True)

@@ -78,6 +78,11 @@ def parse_args():
     parser.add_argument("--verifier-dtype", choices=("float16", "bfloat16", "float32"), default="float16")
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--logsumexp-row-chunk-size", type=int, default=32)
+    parser.add_argument(
+        "--probability-normalization",
+        choices=("retained", "full_vocab"),
+        default="retained",
+    )
     parser.add_argument("--output", default="outputs/prebuilt_tree_verification.json")
     parser.add_argument("--tree-output", default="outputs/prebuilt_drafter_tree.json")
     parser.add_argument("--allow-model-download", action="store_true")
@@ -255,7 +260,9 @@ def main():
 
     print("\n[5/6] Scoring every union-tree candidate with ONE ancestor-masked AR forward...", flush=True)
     tree_score = ARTreeScorer(
-        verifier_model, logsumexp_row_chunk_size=args.logsumexp_row_chunk_size
+        verifier_model,
+        logsumexp_row_chunk_size=args.logsumexp_row_chunk_size,
+        probability_normalization=args.probability_normalization,
     ).score_tree(prefix_ids, tree)
     print(
         f"Tree AR scoring complete: forward_calls={tree_score['verifier_forward_calls']} "

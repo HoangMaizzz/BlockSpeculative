@@ -124,3 +124,21 @@ def test_tree_scorer_runs_transformer_once_and_restricts_lm_head_to_tree_tokens(
             continue
         assert all(candidate.verifier_log_score is not None for candidate in node.candidate_set)
         assert abs(sum(candidate.p_normalized for candidate in node.candidate_set) - 1.0) < 1e-6
+
+
+def test_full_vocab_normalization_reports_real_union_mass():
+    drafter = TwoCandidateDrafter()
+    tree = AsymmetricTreeBuilder(
+        drafter, [2, 1], [2, 1], 0, max_tree_nodes=4, max_tree_tokens=6
+    ).build(torch.tensor([1, 2]))
+    model = TinyCausalLM()
+    result = ARTreeScorer(
+        model,
+        logsumexp_row_chunk_size=1,
+        probability_normalization="full_vocab",
+    ).score_tree(torch.tensor([1, 2]), tree)
+    assert model.model.forward_calls == 1
+    assert result["coverage_is_full_vocab_exact"] is True
+    assert result["probability_space"] == "full_verifier_vocabulary"
+    for statistics in result["node_statistics"]:
+        assert 0.0 <= statistics["raw_candidate_mass_p"] <= 1.0 + 1e-6

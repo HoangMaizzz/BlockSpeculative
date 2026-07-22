@@ -90,16 +90,27 @@ def build_tree_attention_layout(prefix_ids: torch.LongTensor, tree) -> TreeAtten
 
 
 class ARTreeScorer:
-    """Score prebuilt candidates in their local retained probability space.
+    """Score every candidate block in one ancestor-masked transformer pass.
 
-    At every tree node, the retained candidate tokens at a block offset are
-    treated as the complete local support.  This is the intended top-k
-    approximation: no full-vocabulary softmax is materialized.
+    ``retained`` normalization treats retained token IDs as complete support.
+    ``full_vocab`` computes the exact verifier log-normalizer in small row
+    chunks, allowing real union-mass coverage measurement without retaining a
+    [tree_tokens, vocabulary] logits tensor.
     """
 
-    def __init__(self, model, logsumexp_row_chunk_size: int = 32):
+    def __init__(
+        self,
+        model,
+        logsumexp_row_chunk_size: int = 32,
+        probability_normalization: str = "retained",
+    ):
         self.model = model
         self.logsumexp_row_chunk_size = max(1, int(logsumexp_row_chunk_size))
+        if probability_normalization not in {"retained", "full_vocab"}:
+            raise ValueError(
+                "probability_normalization must be retained or full_vocab"
+            )
+        self.probability_normalization = probability_normalization
 
     @property
     def device(self):
@@ -202,6 +213,31 @@ class ARTreeScorer:
                 token_logprobs[occurrence] = (
                     local_logits[target_offset] - torch.logsumexp(local_logits, dim=0)
                 ).cpu()
+            if self.probability_normalization == "full_vocab":
+                # Compute exact target log-probabilities a few prediction rows
+                # at a time. This bounds peak logits memory while preserving the
+                # full-vocabulary denominator needed for true coverage metrics.
+                all_prediction_hidden = hidden_states.index_select(
+                    0, prediction_cpu.to(hidden_states.device)
+                )
+                target_cpu = torch.tensor(target_token_ids, dtype=torch.long)
+                for row_start in range(
+                    0, all_prediction_hidden.shape[0], self.logsumexp_row_chunk_size
+                ):
+                    row_end = min(
+                        row_start + self.logsumexp_row_chunk_size,
+                        all_prediction_hidden.shape[0],
+                    )
+                    full_logits = lm_head(
+                        all_prediction_hidden[row_start:row_end]
+                    ).float()
+                    targets = target_cpu[row_start:row_end].to(full_logits.device)
+                    target_logits = full_logits.gather(1, targets.unsqueeze(1)).squeeze(1)
+                    token_logprobs[row_start:row_end] = (
+                        target_logits - torch.logsumexp(full_logits, dim=-1)
+                    ).cpu()
+                    del full_logits, target_logits
+                del all_prediction_hidden
             del base_output, hidden_states, selected_hidden, selected_weight, retained_logits
         else:
             # Generic fallback for custom models that do not expose the base
@@ -218,11 +254,17 @@ class ARTreeScorer:
             for occurrence, (position, target, retained) in enumerate(
                 zip(prediction_positions, target_token_ids, retained_token_sets)
             ):
-                retained_ids = torch.tensor(retained, dtype=torch.long, device=logits.device)
-                local_logits = logits[position].index_select(0, retained_ids).float()
-                token_logprobs[occurrence] = (
-                    local_logits[retained.index(target)] - torch.logsumexp(local_logits, dim=0)
-                ).cpu()
+                if self.probability_normalization == "full_vocab":
+                    full_logits = logits[position].float()
+                    token_logprobs[occurrence] = (
+                        full_logits[target] - torch.logsumexp(full_logits, dim=0)
+                    ).cpu()
+                else:
+                    retained_ids = torch.tensor(retained, dtype=torch.long, device=logits.device)
+                    local_logits = logits[position].index_select(0, retained_ids).float()
+                    token_logprobs[occurrence] = (
+                        local_logits[retained.index(target)] - torch.logsumexp(local_logits, dim=0)
+                    ).cpu()
             del output, logits
         for edge, (start, end) in zip(layout.edges, edge_slices):
             candidate = tree.nodes[edge.parent_node_id].candidate_set[edge.candidate_index]
@@ -255,7 +297,14 @@ class ARTreeScorer:
             "tree_candidate_blocks_scored": len(layout.edges),
             "tree_candidate_tokens_scored": sum(edge.end - edge.start for edge in layout.edges),
             "attention_mask_shape": list(additive_mask.shape),
-            "probability_space": "retained_tree_tokens_per_node_and_block_offset",
+            "probability_space": (
+                "full_verifier_vocabulary"
+                if self.probability_normalization == "full_vocab"
+                else "retained_tree_tokens_per_node_and_block_offset"
+            ),
+            "probability_normalization": self.probability_normalization,
+            "coverage_is_full_vocab_exact": self.probability_normalization == "full_vocab",
+            "logsumexp_row_chunk_size": self.logsumexp_row_chunk_size,
             "full_vocabulary_logits_materialized": False if used_restricted_lm_head else True,
             "restricted_lm_head": used_restricted_lm_head,
             "projected_logit_count": projected_logit_count,
